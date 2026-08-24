@@ -1,5 +1,7 @@
 """JSONL round-trip and schema stability."""
 
+import json
+
 from keyword_extractor.benchmark import BenchmarkRow, GoldSupervisor, read_jsonl, write_jsonl
 
 
@@ -28,6 +30,17 @@ def test_blank_lines_skipped(tmp_path):
     path = tmp_path / "bench.jsonl"
     path.write_text(_row().model_dump_json() + "\n\n\n", encoding="utf-8")
     assert len(read_jsonl(path)) == 1
+
+
+def test_rows_written_before_complexity_existed_still_load(tmp_path):
+    """Benchmark files committed before the complexity ladder must stay readable."""
+    legacy = _row().model_dump()
+    del legacy["complexity"]
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    [row] = read_jsonl(path)
+    assert row.complexity == "medium"
 
 
 def test_creates_parent_dirs(tmp_path):

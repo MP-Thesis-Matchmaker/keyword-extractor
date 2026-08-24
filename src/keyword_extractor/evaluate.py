@@ -63,6 +63,8 @@ def evaluate(
             {
                 "query": row.query,
                 "source_type": row.source_type,
+                "complexity": row.complexity,
+                "query_style": row.query_style,
                 "source_ids": row.source_ids,
                 "gold": [g.name for g in row.gold_supervisors],
                 "rank": rank,
@@ -73,6 +75,12 @@ def evaluate(
         subset = [r for r in row_results if r["source_type"] == source_type]
         if subset:
             summary[source_type] = _metrics(subset, top_k)
+    # The reason three complexity levels exist: how much does a vaguer query
+    # cost you? Reported separately rather than averaged away.
+    for complexity in ("low", "medium", "high"):
+        subset = [r for r in row_results if r["complexity"] == complexity]
+        if subset:
+            summary[f"complexity:{complexity}"] = _metrics(subset, top_k)
     return EvalReport(summary=summary, rows=row_results)
 
 

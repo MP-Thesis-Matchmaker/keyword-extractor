@@ -31,6 +31,20 @@ Each benchmark row records the query, the extracted keywords, the source publica
 ids, the gold supervisor(s) (name + CRIS UUID where known), and generation metadata — enough
 to audit any row back to its source and to compare runs across parameter changes.
 
+**Complexity levels.** Every supervisor and posting yields **three rows** — `low`, `medium`,
+`high` — from a single keyword extraction, so a run's row count is three times its source
+count (100 supervisors → 300 rows). The levels differ in kind, not just length: `low` takes
+the 2 strongest keywords in one short sentence, `medium` takes 4, and `high` takes 8 in a
+multi-sentence query that names the subject area and asks to combine the topics. Evaluation
+reports hit@k and MRR per level, which is the point of generating them: it measures what a
+vaguer query costs. The full keyword list is kept in `metadata.all_keywords` regardless of
+level.
+
+**`query_style` is what happened, not what was asked.** A row produced by the LLM records
+`"llm"`; one where the endpoint failed and the template took over records `"template"`, and
+the run prints a warning naming how many rows fell back. A benchmark that silently claims
+LLM phrasing for template text is worse than one that admits the fallback.
+
 **Languages.** The corpus is not English-only: 5,956 of the eligible publications are German
 (plus French, Italian, Spanish tails), and thesis postings carry no language label at all in
 the database. One multilingual keyword model therefore handles everything, and each row's
@@ -40,6 +54,10 @@ comparison). German rows get German query phrasing; the smaller French/Italian/S
 keeps native keywords inside an English carrier sentence.
 
 ## Setup
+
+> `.env` is gitignored, so it does **not** pick up changes to `.env.example` — and an entry
+> there silently overrides a changed default (a stale `KEYBERT_MODEL` once kept a run on the
+> old English-only model). Diff the two after pulling.
 
 ```bash
 cp .env.example .env      # defaults work for the local demo DB
@@ -67,8 +85,11 @@ Useful flags: `--sources publications,postings`, `--sample N` (0 = all), `--min-
 restrict publications to one ISO 639-3 code (default: all languages).
 
 LLM phrasing: set `LLM_BASE_URL` (e.g. `http://localhost:11434/v1` with backend-core's
-Ollama container) — otherwise a deterministic template is used, which keeps runs
-byte-reproducible.
+Ollama container, or an OpenAI-compatible API) — otherwise a deterministic template is used,
+which keeps runs byte-reproducible. Optional request fields the endpoint rejects are learned
+once per process and dropped: `temperature: 0` is refused outright by gpt-5 and o-series
+models, so it is sent, blamed, and omitted from every later request rather than failing every
+row. Set `LLM_REASONING_EFFORT=low` for reasoning models on large runs.
 
 ## Evaluate (trial retrieval rounds)
 

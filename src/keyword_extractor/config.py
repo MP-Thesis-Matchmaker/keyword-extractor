@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     llm_model: str = "llama3.1"
     llm_api_key: str | None = None
 
+    # Only for reasoning models (gpt-5, o-series, Qwen3, DeepSeek-R1 and
+    # friends): "minimal"/"low"/"medium"/"high" bound the hidden reasoning an
+    # answer is allowed to cost. Left unset because the field is meaningless to
+    # a non-reasoning model and some endpoints reject fields they do not know --
+    # synthesis/llm.py drops it and retries when that happens. Worth setting for
+    # a large run: a reasoning model can think for many seconds per query.
+    llm_reasoning_effort: str | None = None
+
 
 def get_settings() -> Settings:
     """Return settings, read fresh from the environment."""

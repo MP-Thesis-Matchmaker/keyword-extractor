@@ -27,7 +27,13 @@ from keyword_extractor.fetch import (
     sample_supervisors,
 )
 from keyword_extractor.language import detect_language
-from keyword_extractor.synthesis import QueryContext, QuerySynthesizer, build_synthesizer
+from keyword_extractor.synthesis import (
+    COMPLEXITIES,
+    QueryContext,
+    QuerySynthesizer,
+    build_synthesizer,
+)
+from keyword_extractor.synthesis.template import select_keywords
 
 
 def _compose_doc(title: str, body: str | None) -> str:
@@ -38,23 +44,28 @@ def _compose_doc(title: str, body: str | None) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _pick_style(settings: Settings, requested: str) -> tuple[QuerySynthesizer, str]:
+def _pick_synthesizer(settings: Settings, requested: str) -> QuerySynthesizer:
+    """The synthesiser the run asked for.
+
+    What each row records is decided by the result, not here: an LLM
+    synthesiser that falls back reports "template" per row.
+    """
     if requested == "template":
         from keyword_extractor.synthesis import TemplateSynthesizer
 
-        return TemplateSynthesizer(), "template"
+        return TemplateSynthesizer()
     if requested == "llm":
         if not settings.llm_base_url:
             raise SystemExit("--query-style llm requires LLM_BASE_URL to be set")
         from keyword_extractor.synthesis.llm import LLMSynthesizer
 
-        synth = LLMSynthesizer(
+        return LLMSynthesizer(
             base_url=settings.llm_base_url,
             model=settings.llm_model,
             api_key=settings.llm_api_key,
+            reasoning_effort=settings.llm_reasoning_effort,
         )
-        return synth, "llm"
-    return build_synthesizer(settings), ("llm" if settings.llm_base_url else "template")
+    return build_synthesizer(settings)
 
 
 def _resolve_cris_uuid(cand: SupervisorCandidate, pubs: list[PublicationRow]) -> str | None:
@@ -76,7 +87,6 @@ def _supervisor_rows(
     conn,
     extractor: KeywordExtractor,
     synthesizer: QuerySynthesizer,
-    style: str,
     settings: Settings,
     args: argparse.Namespace,
 ) -> list[BenchmarkRow]:
@@ -129,29 +139,38 @@ def _supervisor_rows(
         # column describes the record, and 87 of 300 deu-labelled publications
         # carry an English abstract. Both are recorded so the gap stays visible.
         text_language = _most_common([detect_language(doc) for _, doc in pairs])
-        context = QueryContext(
-            seed=cris_uuid or cand.name, department=department, language=text_language
-        )
-        rows.append(
-            BenchmarkRow(
-                query=synthesizer.synthesize(keywords, context),
-                keywords=keywords,
-                source_type="publication",
-                source_ids=[p.id for p in pubs],
-                gold_supervisors=[GoldSupervisor(name=cand.name, cris_uuid=cris_uuid)],
-                granularity="supervisor",
-                query_style=style,  # type: ignore[arg-type]
-                metadata={
-                    "department": department,
-                    "year_min": min(years) if years else None,
-                    "year_max": max(years) if years else None,
-                    "text_language": text_language,
-                    "db_language": _most_common([p.language for p in pubs]),
-                    "keybert_model": settings.keybert_model,
-                    "seed": args.seed,
-                },
+        # One extraction, three queries: the levels slice the same score-ordered
+        # keyword list, so the extra rows cost nothing but synthesis.
+        for complexity in COMPLEXITIES:
+            context = QueryContext(
+                seed=cris_uuid or cand.name,
+                department=department,
+                language=text_language,
+                complexity=complexity,
             )
-        )
+            result = synthesizer.synthesize(keywords, context)
+            rows.append(
+                BenchmarkRow(
+                    query=result.text,
+                    keywords=select_keywords(keywords, complexity),
+                    source_type="publication",
+                    source_ids=[p.id for p in pubs],
+                    gold_supervisors=[GoldSupervisor(name=cand.name, cris_uuid=cris_uuid)],
+                    granularity="supervisor",
+                    query_style=result.style,
+                    complexity=complexity,
+                    metadata={
+                        "department": department,
+                        "year_min": min(years) if years else None,
+                        "year_max": max(years) if years else None,
+                        "text_language": text_language,
+                        "db_language": _most_common([p.language for p in pubs]),
+                        "keybert_model": settings.keybert_model,
+                        "all_keywords": keywords,
+                        "seed": args.seed,
+                    },
+                )
+            )
     return rows
 
 
@@ -159,7 +178,6 @@ def _posting_rows(
     conn,
     extractor: KeywordExtractor,
     synthesizer: QuerySynthesizer,
-    style: str,
     settings: Settings,
     args: argparse.Namespace,
 ) -> list[BenchmarkRow]:
@@ -178,28 +196,35 @@ def _posting_rows(
         # posting.language is NULL for every posting in the corpus, so detection
         # is the only signal available here -- not a fallback.
         text_language = detect_language(_compose_doc(posting.title, posting.description))
-        context = QueryContext(
-            seed=posting.id, department=posting.department, language=text_language
-        )
-        rows.append(
-            BenchmarkRow(
-                query=synthesizer.synthesize(keywords, context),
-                keywords=keywords,
-                source_type="posting",
-                source_ids=[posting.id],
-                gold_supervisors=[GoldSupervisor(name=s.name) for s in posting.supervisors],
-                granularity="posting",
-                query_style=style,  # type: ignore[arg-type]
-                metadata={
-                    "department": posting.department,
-                    "faculty": posting.faculty,
-                    "text_language": text_language,
-                    "db_language": posting.language,
-                    "keybert_model": settings.keybert_model,
-                    "seed": args.seed,
-                },
+        for complexity in COMPLEXITIES:
+            context = QueryContext(
+                seed=posting.id,
+                department=posting.department,
+                language=text_language,
+                complexity=complexity,
             )
-        )
+            result = synthesizer.synthesize(keywords, context)
+            rows.append(
+                BenchmarkRow(
+                    query=result.text,
+                    keywords=select_keywords(keywords, complexity),
+                    source_type="posting",
+                    source_ids=[posting.id],
+                    gold_supervisors=[GoldSupervisor(name=s.name) for s in posting.supervisors],
+                    granularity="posting",
+                    query_style=result.style,
+                    complexity=complexity,
+                    metadata={
+                        "department": posting.department,
+                        "faculty": posting.faculty,
+                        "text_language": text_language,
+                        "db_language": posting.language,
+                        "keybert_model": settings.keybert_model,
+                        "all_keywords": keywords,
+                        "seed": args.seed,
+                    },
+                )
+            )
     return rows
 
 
@@ -212,7 +237,7 @@ def _generate(args: argparse.Namespace) -> int:
     if args.top_n:
         settings = settings.model_copy(update={"keybert_top_n": args.top_n})
     extractor = build_extractor(settings)
-    synthesizer, style = _pick_style(settings, args.query_style)
+    synthesizer = _pick_synthesizer(settings, args.query_style)
     sources = {s.strip() for s in args.sources.split(",") if s.strip()}
     unknown = sources - {"publications", "postings"}
     if unknown:
@@ -221,13 +246,22 @@ def _generate(args: argparse.Namespace) -> int:
     rows: list[BenchmarkRow] = []
     with connect(settings) as conn:
         if "publications" in sources:
-            rows.extend(_supervisor_rows(conn, extractor, synthesizer, style, settings, args))
+            rows.extend(_supervisor_rows(conn, extractor, synthesizer, settings, args))
         if "postings" in sources:
-            rows.extend(_posting_rows(conn, extractor, synthesizer, style, settings, args))
+            rows.extend(_posting_rows(conn, extractor, synthesizer, settings, args))
 
     count = write_jsonl(rows, Path(args.out))
     by_type = Counter(r.source_type for r in rows)
     print(f"wrote {count} benchmark rows to {args.out} ({dict(by_type)})")
+    # A degraded run must be visible in the summary, not only in a log line
+    # scrolled past 300 rows ago.
+    fell_back = sum(1 for r in rows if r.query_style == "template")
+    if args.query_style == "llm" and fell_back:
+        print(
+            f"WARNING: {fell_back} of {count} rows fell back to template phrasing; "
+            "check the logged endpoint error above",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -263,7 +297,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="keyword-extractor", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    gen = sub.add_parser("generate", help="synthesise benchmark queries from the database")
+    gen = sub.add_parser(
+        "generate",
+        help="synthesise benchmark queries from the database",
+        description="Every supervisor and posting yields three rows -- low, medium and high "
+        "complexity -- from one keyword extraction, so row counts are three times the number "
+        "of sources (100 supervisors produce 300 rows). Scope a run with --sources and --sample.",
+    )
     gen.add_argument("--out", default="data/benchmark.jsonl")
     gen.add_argument("--sources", default="publications,postings")
     gen.add_argument("--supervisors", nargs="*", help="explicit supervisor names; skips sampling")

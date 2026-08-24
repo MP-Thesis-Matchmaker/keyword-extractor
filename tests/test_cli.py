@@ -117,7 +117,7 @@ def test_generate_end_to_end(tmp_path, monkeypatch):
     rows = read_jsonl(out)
     assert {r.source_type for r in rows} == {"publication", "posting"}
 
-    pub_row = next(r for r in rows if r.source_type == "publication")
+    pub_row = next(r for r in rows if r.source_type == "publication" and r.complexity == "medium")
     assert pub_row.gold_supervisors[0].name == "Doe, Jane"
     assert pub_row.gold_supervisors[0].cris_uuid == "uuid-doe"
     assert pub_row.source_ids == ["20.500.14742/1", "20.500.14742/2"]
@@ -129,6 +129,9 @@ def test_generate_end_to_end(tmp_path, monkeypatch):
     post_row = next(r for r in rows if r.source_type == "posting")
     assert post_row.gold_supervisors[0].name == "Roe, Richard"
     assert post_row.granularity == "posting"
+
+    # Every source yields the full complexity ladder.
+    assert {r.complexity for r in rows} == {"low", "medium", "high"}
 
     # PII guard: no email-shaped string anywhere in the artefact.
     assert "@" not in out.read_text(encoding="utf-8")
@@ -153,13 +156,21 @@ def test_german_supervisor_gets_german_query_and_recorded_languages(tmp_path, mo
     )
     assert rc == 0
 
-    [row] = read_jsonl(out)
+    rows = read_jsonl(out)
+    assert len(rows) == 3  # one supervisor, three complexity levels
+    row = next(r for r in rows if r.complexity == "medium")
     assert row.metadata["text_language"] == "deu"
     assert row.metadata["db_language"] == "deu"
-    assert "Abschlussarbeit" in row.query
+    assert "Ich" in row.query  # German phrasing
     # The publication with an empty title and a whitespace abstract contributed
     # no text, so it must not be cited as a source.
     assert row.source_ids == ["20.500.14742/10", "20.500.14742/11"]
+    # All three levels share provenance and differ only in query and keywords.
+    assert {tuple(r.source_ids) for r in rows} == {tuple(row.source_ids)}
+    assert len({r.query for r in rows}) == 3
+    low = next(r for r in rows if r.complexity == "low")
+    assert len(low.keywords) <= 2
+    assert len(low.keywords) < len(next(r for r in rows if r.complexity == "high").keywords)
 
 
 def test_posting_language_is_detected_when_the_column_is_null(tmp_path, monkeypatch):
@@ -168,13 +179,43 @@ def test_posting_language_is_detected_when_the_column_is_null(tmp_path, monkeypa
     out = tmp_path / "bench_postings.jsonl"
     assert cli.main(["generate", "--out", str(out), "--sources", "postings"]) == 0
 
-    rows = {r.source_ids[0]: r for r in read_jsonl(out)}
-    german = rows["posting-2"]
+    rows = {
+        (r.source_ids[0], r.complexity): r for r in read_jsonl(out)
+    }
+    german = rows[("posting-2", "medium")]
     assert german.metadata["text_language"] == "deu"
     assert german.metadata["db_language"] is None  # never labelled in the DB
-    assert "Abschlussarbeit" in german.query
-    assert rows["posting-1"].metadata["text_language"] == "eng"
-    assert "Abschlussarbeit" not in rows["posting-1"].query
+    assert "Ich" in german.query
+    english = rows[("posting-1", "medium")]
+    assert english.metadata["text_language"] == "eng"
+    assert "Ich" not in english.query
+
+
+def test_fallback_rows_admit_they_are_template_text(tmp_path, monkeypatch, capsys):
+    """A run that asks for LLM but gets 400s must not label the rows "llm"."""
+    monkeypatch.setenv("KEYBERT_MODEL", "fake")
+    monkeypatch.setenv("LLM_BASE_URL", "http://unreachable.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "some-model")
+    _patch_db(monkeypatch)
+    out = tmp_path / "bench_fallback.jsonl"
+
+    rc = cli.main(
+        [
+            "generate",
+            "--out",
+            str(out),
+            "--supervisors",
+            "Doe, Jane",
+            "--sources",
+            "publications",
+            "--query-style",
+            "llm",
+        ]
+    )
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert rows and all(r.query_style == "template" for r in rows)
+    assert "fell back to template phrasing" in capsys.readouterr().err
 
 
 def test_language_all_is_a_synonym_for_no_filter(tmp_path, monkeypatch):
