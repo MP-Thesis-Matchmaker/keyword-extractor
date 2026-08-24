@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keyword-extractor"
+version = "0.0.1"
+description = "Benchmark-query synthesis for the thesis matchmaker: KeyBERT keywords from supervisor publications and thesis postings, extended into natural-language queries."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
+]
+
+[project.optional-dependencies]
+# KeyBERT pulls sentence-transformers -> torch. Kept out of the default install
+# so CI and the fake extractor need no model download (same split backend-core
+# makes with its `embeddings` extra). Torch bounds copied from backend-core to
+# keep both repos on the same torch minor.
+extraction = [
+    "keybert>=0.9",
+    "sentence-transformers>=5.6",
+    "torch>=2.6,<2.13",
+]
+# Trial retrieval imports backend-core directly (sibling checkout under repos/).
+# [embeddings] because evaluation embeds queries with the real bge-m3 model.
+eval = [
+    "thesis-matchmaker[embeddings]",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# CPU-only torch wheels on linux; macOS resolves the stock universal wheel.
+# Copied from backend-core pyproject.toml -- see the rationale there.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+thesis-matchmaker = { path = "../backend-core" }
+
+[project.scripts]
+keyword-extractor = "keyword_extractor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

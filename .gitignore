@@ -1,0 +1,17 @@
+# Local configuration with credentials
+.env
+
+# Generated benchmark and eval artefacts (contain researcher names; stay in team)
+data/*
+!data/.gitkeep
+
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
