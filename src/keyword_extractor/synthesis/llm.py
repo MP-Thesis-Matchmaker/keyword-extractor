@@ -52,6 +52,10 @@ class LLMSynthesizer:
         user = "Keywords: " + "; ".join(keywords)
         if context.department:
             user += f"\nSubject area: {context.department}"
+        # The keywords are in the language of the source publications, so the
+        # carrier sentence has to match or the query reads as code-switching.
+        if context.language == "deu":
+            user += "\nWrite the query in German."
         payload = {
             "model": self._model,
             "messages": [

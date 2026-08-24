@@ -19,6 +19,10 @@ class QueryContext:
 
     seed: str
     department: str | None = None
+    # Language of the text the keywords came from ("deu" / "eng" / None),
+    # detected rather than read from the database -- see language.py for why.
+    # Chooses the phrasing; anything but "deu" is phrased in English.
+    language: str | None = None
 
 
 class QuerySynthesizer(Protocol):

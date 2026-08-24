@@ -23,11 +23,31 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://matchmaker:matchmaker@localhost:5432/matchmaker"
 
     # KeyBERT embedding model. The special value "fake" selects the deterministic
-    # offline extractor (tests, CI, no torch). Deliberately NOT bge-m3 by default:
-    # picking keywords in the retrieval model's own embedding space would measure
-    # the retriever's agreement with itself.
-    keybert_model: str = "all-MiniLM-L6-v2"
+    # offline extractor (tests, CI, no torch).
+    #
+    # Multilingual because the corpus is: about 10% of publications with an
+    # abstract and a UZH author are not English (5,956 deu, plus fra/ita/spa
+    # tails), and `posting.language` is NULL for every posting, so there is no
+    # column to route German documents to a second model with even if we wanted
+    # to. This is the model KeyBERT's README recommends for that case.
+    #
+    # Still deliberately NOT bge-m3, the retrieval model: picking keywords in the
+    # embedding space of the system under test would measure the retriever's
+    # agreement with itself.
+    keybert_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
     keybert_top_n: int = 8
+
+    # Token cap for the document embedding KeyBERT ranks candidates against.
+    # None keeps whatever the model ships -- 128 for the multilingual MiniLM,
+    # which is what it was distilled at. Raising it to 256 is architecturally
+    # fine (the checkpoint carries 512 position embeddings) but is a deliberate
+    # sensitivity run rather than a default, since those positions were never
+    # tuned during the paraphrase distillation.
+    #
+    # The truncation matters less than it looks: candidate n-grams come from the
+    # FULL text through KeyBERT's CountVectorizer, only the document vector is
+    # capped, and a supervisor row pools keyphrases over up to 20 publications.
+    keybert_max_seq_length: int | None = None
     # keyphrase_ngram_range = (1, keybert_ngram_max)
     keybert_ngram_max: int = 2
     # Maximal Marginal Relevance: trades raw similarity for diversity, so the

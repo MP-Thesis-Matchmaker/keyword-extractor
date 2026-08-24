@@ -18,6 +18,15 @@ def test_fake_extractor_strips_stopwords():
     assert phrases == ["learning"]
 
 
+def test_fake_extractor_strips_german_stopwords():
+    [keywords] = FakeExtractor().extract(
+        ["Die Kommunikation und der Medienwandel werden über Kommunikation erklärt"]
+    )
+    phrases = [p for p, _ in keywords]
+    assert phrases[0] == "kommunikation"
+    assert not {"und", "der", "die", "über", "werden"} & set(phrases)
+
+
 def test_build_extractor_dispatches_fake():
     extractor = build_extractor(Settings(keybert_model="fake"))
     assert isinstance(extractor, FakeExtractor)

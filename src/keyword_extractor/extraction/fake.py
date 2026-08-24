@@ -12,17 +12,20 @@ import re
 from collections import Counter
 from collections.abc import Sequence
 
-_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z-]{2,}")
+from keyword_extractor.language import ENGLISH_FUNCTION_WORDS, GERMAN_FUNCTION_WORDS
 
-# Just enough to keep the fake's output looking like keywords rather than
-# function words; NOT a linguistic claim (see backend-core indexing/documents.py
-# on why real pipelines keep stop words for transformers).
-_STOPWORDS = frozenset(
-    """a an and are as at be but by for from has have in is it its of on or that the
-    this to was we were which with not their our they using use based can also than
-    these those between during into through over under both more most other some such
-    only own same so too very will just about against each few how all any been being
-    does doing did further here there when where why what who whom""".split()
+# Unicode-aware so German words survive tokenisation intact; three characters
+# minimum, which drops most inflectional debris.
+_WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+# English and German, so the fake behaves sensibly on the German share of the
+# corpus instead of returning "der" and "und" as a supervisor's research topics.
+# NOT a linguistic claim (see backend-core indexing/documents.py on why real
+# transformer pipelines keep their stop words).
+_STOPWORDS = (
+    ENGLISH_FUNCTION_WORDS
+    | GERMAN_FUNCTION_WORDS
+    | frozenset("using use based just does doing did".split())
 )
 
 

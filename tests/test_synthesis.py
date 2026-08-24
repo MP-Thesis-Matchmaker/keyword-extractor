@@ -32,6 +32,59 @@ def test_template_handles_empty_keywords():
     assert "open research topic" in query
 
 
+GERMAN_KEYWORDS = ["Kommunikationsprozesse", "lokale Politik", "Medienwandel"]
+
+
+def test_german_context_selects_german_template():
+    query = TemplateSynthesizer().synthesize(
+        GERMAN_KEYWORDS, QueryContext(seed="uuid-de", language="deu")
+    )
+    assert "Abschlussarbeit" in query
+    assert " und " in query  # German conjunction, not "and"
+    for keyword in GERMAN_KEYWORDS:
+        assert keyword in query
+
+
+def test_german_empty_keywords_stays_german():
+    query = TemplateSynthesizer().synthesize([], QueryContext(seed="x", language="deu"))
+    assert "Forschungsthema" in query
+
+
+def test_non_german_languages_fall_back_to_english():
+    synth = TemplateSynthesizer()
+    context_none = QueryContext(seed="uuid-1", language=None)
+    for language in (None, "eng", "fra", "ita"):
+        query = synth.synthesize(KEYWORDS, QueryContext(seed="uuid-1", language=language))
+        assert query == synth.synthesize(KEYWORDS, context_none)
+        assert "Abschlussarbeit" not in query
+
+
+def test_llm_prompt_requests_german_when_language_is_german():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode("utf-8")
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "Eine Arbeit über Medienwandel."}}]}
+        )
+
+    synth = LLMSynthesizer("http://test/v1", "m", client=_client(handler))
+    synth.synthesize(GERMAN_KEYWORDS, QueryContext(seed="x", language="deu"))
+    assert "Write the query in German." in seen["body"]
+
+
+def test_llm_prompt_omits_language_instruction_for_english():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode("utf-8")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "A thesis."}}]})
+
+    synth = LLMSynthesizer("http://test/v1", "m", client=_client(handler))
+    synth.synthesize(KEYWORDS, QueryContext(seed="x", language="eng"))
+    assert "German" not in seen["body"]
+
+
 def test_build_synthesizer_defaults_to_template():
     synth = build_synthesizer(Settings(llm_base_url=None))
     assert isinstance(synth, TemplateSynthesizer)

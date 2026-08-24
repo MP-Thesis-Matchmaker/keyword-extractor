@@ -26,6 +26,7 @@ from keyword_extractor.fetch import (
     list_supervisor_candidates,
     sample_supervisors,
 )
+from keyword_extractor.language import detect_language
 from keyword_extractor.synthesis import QueryContext, QuerySynthesizer, build_synthesizer
 
 
@@ -93,8 +94,11 @@ def _supervisor_rows(
 
     # One flat extract() call over every document, then sliced back per
     # supervisor: the extractor batches embeddings across the whole run.
+    # (publication, doc) pairs rather than two parallel lists, because the row's
+    # language and its source_ids both have to follow the documents that
+    # actually carried text.
     all_docs: list[str] = []
-    slices: list[tuple[SupervisorCandidate, list[PublicationRow], int, int]] = []
+    slices: list[tuple[SupervisorCandidate, list[tuple[PublicationRow, str]], int]] = []
     for cand in chosen:
         pubs = fetch_publications(
             conn,
@@ -102,24 +106,32 @@ def _supervisor_rows(
             language=args.language,
             max_pubs=args.max_pubs or None,
         )
-        docs = [_compose_doc(p.title, p.abstract) for p in pubs]
-        docs = [d for d in docs if d]
-        if not docs:
+        pairs = [(p, doc) for p in pubs if (doc := _compose_doc(p.title, p.abstract))]
+        if not pairs:
             print(f"skipping {cand.name!r}: no usable publications", file=sys.stderr)
             continue
-        slices.append((cand, pubs, len(all_docs), len(docs)))
-        all_docs.extend(docs)
+        slices.append((cand, pairs, len(all_docs)))
+        all_docs.extend(doc for _, doc in pairs)
 
     per_doc = extractor.extract(all_docs)
     rows: list[BenchmarkRow] = []
-    for cand, pubs, start, length in slices:
-        keywords = aggregate_keywords(per_doc[start : start + length], top_n=settings.keybert_top_n)
+    for cand, pairs, start in slices:
+        keywords = aggregate_keywords(
+            per_doc[start : start + len(pairs)], top_n=settings.keybert_top_n
+        )
         if not keywords:
             continue
+        pubs = [p for p, _ in pairs]
         cris_uuid = _resolve_cris_uuid(cand, pubs)
         department = _most_common([p.department for p in pubs])
         years = [p.year for p in pubs if p.year]
-        context = QueryContext(seed=cris_uuid or cand.name, department=department)
+        # Detected from the text, not read from publication.language: that
+        # column describes the record, and 87 of 300 deu-labelled publications
+        # carry an English abstract. Both are recorded so the gap stays visible.
+        text_language = _most_common([detect_language(doc) for _, doc in pairs])
+        context = QueryContext(
+            seed=cris_uuid or cand.name, department=department, language=text_language
+        )
         rows.append(
             BenchmarkRow(
                 query=synthesizer.synthesize(keywords, context),
@@ -133,7 +145,8 @@ def _supervisor_rows(
                     "department": department,
                     "year_min": min(years) if years else None,
                     "year_max": max(years) if years else None,
-                    "language": args.language,
+                    "text_language": text_language,
+                    "db_language": _most_common([p.language for p in pubs]),
                     "keybert_model": settings.keybert_model,
                     "seed": args.seed,
                 },
@@ -162,7 +175,12 @@ def _posting_rows(
         keywords = aggregate_keywords([doc_keywords], top_n=settings.keybert_top_n)
         if not keywords:
             continue
-        context = QueryContext(seed=posting.id, department=posting.department)
+        # posting.language is NULL for every posting in the corpus, so detection
+        # is the only signal available here -- not a fallback.
+        text_language = detect_language(_compose_doc(posting.title, posting.description))
+        context = QueryContext(
+            seed=posting.id, department=posting.department, language=text_language
+        )
         rows.append(
             BenchmarkRow(
                 query=synthesizer.synthesize(keywords, context),
@@ -175,7 +193,8 @@ def _posting_rows(
                 metadata={
                     "department": posting.department,
                     "faculty": posting.faculty,
-                    "language": posting.language,
+                    "text_language": text_language,
+                    "db_language": posting.language,
                     "keybert_model": settings.keybert_model,
                     "seed": args.seed,
                 },
@@ -185,6 +204,10 @@ def _posting_rows(
 
 
 def _generate(args: argparse.Namespace) -> int:
+    # "all" and "" are spellings of "no language filter"; the keyword model is
+    # multilingual, so restricting the corpus is now the special case.
+    if args.language in ("all", ""):
+        args.language = None
     settings = get_settings()
     if args.top_n:
         settings = settings.model_copy(update={"keybert_top_n": args.top_n})
@@ -249,7 +272,12 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument(
         "--max-pubs", type=int, default=20, help="most recent pubs per supervisor; 0 = all"
     )
-    gen.add_argument("--language", default="eng")
+    gen.add_argument(
+        "--language",
+        default=None,
+        help="restrict publications to one ISO 639-3 language, e.g. eng or deu; "
+        "default is all languages",
+    )
     gen.add_argument("--seed", type=int, default=42)
     gen.add_argument("--top-n", type=int, default=None, help="override KEYBERT_TOP_N")
     gen.add_argument("--query-style", choices=("auto", "template", "llm"), default="auto")

@@ -15,7 +15,7 @@ Postgres (backend-core's DB)
                                        clean (prepare_text, copied
                                        from backend-core indexing)
                                                     ▼
-                                       KeyBERT (all-MiniLM-L6-v2)
+                            KeyBERT (paraphrase-multilingual-MiniLM-L12-v2)
                                                     ▼
                                        aggregate keyphrases
                                                     ▼
@@ -30,6 +30,14 @@ Postgres (backend-core's DB)
 Each benchmark row records the query, the extracted keywords, the source publication/posting
 ids, the gold supervisor(s) (name + CRIS UUID where known), and generation metadata — enough
 to audit any row back to its source and to compare runs across parameter changes.
+
+**Languages.** The corpus is not English-only: 5,956 of the eligible publications are German
+(plus French, Italian, Spanish tails), and thesis postings carry no language label at all in
+the database. One multilingual keyword model therefore handles everything, and each row's
+language is *detected from the text* it was extracted from (`metadata.text_language`) rather
+than taken from `publication.language` (`metadata.db_language`, recorded alongside for
+comparison). German rows get German query phrasing; the smaller French/Italian/Spanish tail
+keeps native keywords inside an English carrier sentence.
 
 ## Setup
 
@@ -55,7 +63,8 @@ KEYBERT_MODEL=fake uv run keyword-extractor generate --sample 3
 ```
 
 Useful flags: `--sources publications,postings`, `--sample N` (0 = all), `--min-pubs`,
-`--max-pubs`, `--language eng`, `--seed`, `--top-n`, `--query-style auto|template|llm`.
+`--max-pubs`, `--seed`, `--top-n`, `--query-style auto|template|llm`, and `--language` to
+restrict publications to one ISO 639-3 code (default: all languages).
 
 LLM phrasing: set `LLM_BASE_URL` (e.g. `http://localhost:11434/v1` with backend-core's
 Ollama container) — otherwise a deterministic template is used, which keeps runs
@@ -91,10 +100,28 @@ uv run ruff check
   attaches ~38k publications to wrong `uzh_authors` entries. Mitigations here: sampling
   requires a resolved CRIS UUID by default, `--supervisors` allows hand-picking, and every
   row records its `source_ids` for audit. Headline numbers inherit this upstream noise.
-- **Deliberately independent keyword model.** KeyBERT runs `all-MiniLM-L6-v2`, not the
-  retrieval model (`BAAI/bge-m3`) — extracting keywords in the system-under-test's own
-  embedding space would measure the retriever's agreement with itself. A bge-m3 run
-  (`KEYBERT_MODEL=BAAI/bge-m3`) is an upper-bound sensitivity check, not the benchmark.
+- **Deliberately independent keyword model.** KeyBERT runs
+  `paraphrase-multilingual-MiniLM-L12-v2`, not the retrieval model (`BAAI/bge-m3`) —
+  extracting keywords in the system-under-test's own embedding space would measure the
+  retriever's agreement with itself. A bge-m3 run (`KEYBERT_MODEL=BAAI/bge-m3`) is an
+  upper-bound sensitivity check, not the benchmark.
+- **`publication.language` describes the record, not the abstract.** In a 300-row sample of
+  `deu`-labelled publications, 87 carried a fully English abstract (German title, English
+  abstract). That is why query language comes from detection rather than the column, and why
+  both values are recorded per row.
+- **Truncated document view.** The multilingual model ships `max_seq_length` 128 against a
+  median abstract of roughly 240 tokens, so keyphrases are ranked against the document's
+  opening rather than all of it. Candidate phrases themselves come from the full text, and
+  supervisor rows pool up to 20 publications, which absorbs most of this. Set
+  `KEYBERT_MAX_SEQ_LENGTH=256` for a sensitivity run.
+- **Language detection is a heuristic** (distinctive function-word overlap, no extra
+  dependency). A misfire changes only the query phrasing, never a gold label.
+- **Bigrams can be words that were never adjacent.** KeyBERT builds candidates with
+  scikit-learn's `CountVectorizer`, which removes stop words *before* forming n-grams, so
+  `keyphrase_ngram_range=(1, 2)` can emit pairs like `kriminalistischer juristischer` whose
+  words sit one or two tokens apart in the abstract (verified: none of the sampled bigrams
+  occur adjacently in their source text). Affects both languages and predates the
+  multilingual switch. Fix if it hurts retrieval: `KEYBERT_NGRAM_MAX=1` for single words.
 - **Not a generalization test.** Queries are derived from the same corpus retrieval
   searches; this benchmarks retrieval quality, not out-of-distribution behaviour.
 - **Personal data.** The DB and the generated files contain researchers' names. Supervisor
