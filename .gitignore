@@ -4,6 +4,7 @@
 # Generated benchmark and eval artefacts (contain researcher names; stay in team)
 data/*
 !data/.gitkeep
+!data/sample
 
 # IDE
 .idea/
