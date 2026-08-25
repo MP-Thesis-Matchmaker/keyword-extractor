@@ -26,3 +26,7 @@ def isolate_settings(monkeypatch):
     # No model download in the suite; individual tests may still override.
     monkeypatch.setenv("KEYBERT_MODEL", "fake")
     monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost:1/nonexistent_test")
+    # One attempt: a test that deliberately points at an unreachable host must
+    # not spend the retry backoff. Retry behaviour is tested directly, with an
+    # injected transport and zero backoff.
+    monkeypatch.setenv("LLM_MAX_ATTEMPTS", "1")

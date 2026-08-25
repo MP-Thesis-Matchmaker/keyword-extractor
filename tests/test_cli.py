@@ -3,6 +3,8 @@
 import contextlib
 import json
 
+import pytest
+
 import keyword_extractor.cli as cli
 from keyword_extractor.benchmark import read_jsonl
 from keyword_extractor.fetch import PostingRow, PostingSupervisor, PublicationRow
@@ -110,7 +112,7 @@ def test_generate_end_to_end(tmp_path, monkeypatch):
     out = tmp_path / "bench.jsonl"
 
     rc = cli.main(
-        ["generate", "--out", str(out), "--supervisors", "Doe, Jane", "--query-style", "auto"]
+        ["generate", "--out", str(out), "--supervisor-names", "Doe, Jane", "--query-style", "auto"]
     )
     assert rc == 0
 
@@ -148,7 +150,7 @@ def test_german_supervisor_gets_german_query_and_recorded_languages(tmp_path, mo
             "generate",
             "--out",
             str(out),
-            "--supervisors",
+            "--supervisor-names",
             "Udris, Linards",
             "--sources",
             "publications",
@@ -204,7 +206,7 @@ def test_fallback_rows_admit_they_are_template_text(tmp_path, monkeypatch, capsy
             "generate",
             "--out",
             str(out),
-            "--supervisors",
+            "--supervisor-names",
             "Doe, Jane",
             "--sources",
             "publications",
@@ -234,11 +236,11 @@ def test_language_all_is_a_synonym_for_no_filter(tmp_path, monkeypatch):
             "generate",
             "--out",
             str(out),
-            "--supervisors",
+            "--supervisor-names",
             "Doe, Jane",
             "--sources",
             "publications",
-            "--language",
+            "--publication-language",
             "all",
         ]
     )
@@ -254,7 +256,7 @@ def test_generate_skips_supervisor_without_pubs(tmp_path, monkeypatch, capsys):
             "generate",
             "--out",
             str(out),
-            "--supervisors",
+            "--supervisor-names",
             "Nobody, Here",
             "--sources",
             "publications",
@@ -269,7 +271,7 @@ def test_evaluate_cli_with_injected_report(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("KEYBERT_MODEL", "fake")
     _patch_db(monkeypatch)
     bench = tmp_path / "bench.jsonl"
-    cli.main(["generate", "--out", str(bench), "--supervisors", "Doe, Jane"])
+    cli.main(["generate", "--out", str(bench), "--supervisor-names", "Doe, Jane"])
     capsys.readouterr()  # discard generate output
 
     import keyword_extractor.evaluate as evaluate_module
@@ -287,3 +289,74 @@ def test_evaluate_cli_with_injected_report(tmp_path, monkeypatch, capsys):
     assert rc == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["overall"]["hit@5"] == 1.0
+
+
+def test_posting_sample_bounds_the_run(tmp_path, monkeypatch):
+    """--supervisor-sample 1 once still walked all 579 postings; it must not."""
+    monkeypatch.setenv("KEYBERT_MODEL", "fake")
+    _patch_db(monkeypatch)
+    out = tmp_path / "bench_one_posting.jsonl"
+
+    rc = cli.main(
+        ["generate", "--out", str(out), "--sources", "postings", "--posting-sample", "1"]
+    )
+
+    assert rc == 0
+    rows = read_jsonl(out)
+    assert len(rows) == 3  # one posting, three complexity levels
+    assert len({r.source_ids[0] for r in rows}) == 1
+
+
+def test_posting_sample_is_seeded(tmp_path, monkeypatch):
+    monkeypatch.setenv("KEYBERT_MODEL", "fake")
+    _patch_db(monkeypatch)
+
+    def chosen(seed: str) -> set[str]:
+        out = tmp_path / f"bench_{seed}.jsonl"
+        cli.main(
+            [
+                "generate",
+                "--out",
+                str(out),
+                "--sources",
+                "postings",
+                "--posting-sample",
+                "1",
+                "--seed",
+                seed,
+            ]
+        )
+        return {r.source_ids[0] for r in read_jsonl(out)}
+
+    assert chosen("42") == chosen("42")
+
+
+def test_progress_reaches_stderr(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KEYBERT_MODEL", "fake")
+    _patch_db(monkeypatch)
+    out = tmp_path / "bench_progress.jsonl"
+
+    cli.main(
+        [
+            "generate",
+            "--out",
+            str(out),
+            "--supervisor-names",
+            "Doe, Jane",
+            "--sources",
+            "publications",
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert "publications" in err
+    assert "3/3 rows" in err
+
+
+def test_renamed_flags_name_their_replacement(monkeypatch):
+    """A line recalled from shell history must say where the flag went."""
+    _patch_db(monkeypatch)
+    for old, new in cli._RENAMED_FLAGS.items():
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main(["generate", old, "1"])
+        assert new in str(excinfo.value)

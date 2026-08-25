@@ -1,10 +1,13 @@
 """SQL builders and pure helpers -- no database."""
 
 from keyword_extractor.fetch import (
+    PostingRow,
+    PostingSupervisor,
     SupervisorCandidate,
     parse_posting_supervisors,
     postings_query,
     publications_query,
+    sample_postings,
     sample_supervisors,
     supervisor_candidates_query,
 )
@@ -75,3 +78,29 @@ def test_sample_supervisors_reproducible_and_order_independent():
 def test_sample_supervisors_zero_means_all():
     candidates = [SupervisorCandidate(name="A", cris_uuid="1", publication_count=1)]
     assert sample_supervisors(candidates, 0) == candidates
+
+
+def _postings(n: int) -> list[PostingRow]:
+    return [
+        PostingRow(
+            id=f"posting-{i}",
+            title=f"Thesis {i}",
+            supervisors=[PostingSupervisor(name=f"Name, {i}")],
+        )
+        for i in range(n)
+    ]
+
+
+def test_sample_postings_reproducible_and_order_independent():
+    postings = _postings(20)
+    a = sample_postings(postings, 5, seed=7)
+    b = sample_postings(list(reversed(postings)), 5, seed=7)
+    assert [p.id for p in a] == [p.id for p in b]
+    assert len(a) == 5
+
+
+def test_sample_postings_zero_means_all():
+    """0 is how a run deliberately takes the whole 579-posting corpus."""
+    postings = _postings(3)
+    assert sample_postings(postings, 0) == postings
+    assert sample_postings(postings, 99) == postings

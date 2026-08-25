@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     # a large run: a reasoning model can think for many seconds per query.
     llm_reasoning_effort: str | None = None
 
+    # Attempts per query when the endpoint fails *transiently* -- a 429, a 5xx,
+    # a read timeout. Unrelated to the unsupported-field retry in synthesis/llm.py,
+    # which corrects the payload and costs no attempt. Worth having because a
+    # long run makes thousands of sequential calls and a single blip would
+    # otherwise downgrade that row to template phrasing for good.
+    llm_max_attempts: int = 3
+
 
 def get_settings() -> Settings:
     """Return settings, read fresh from the environment."""

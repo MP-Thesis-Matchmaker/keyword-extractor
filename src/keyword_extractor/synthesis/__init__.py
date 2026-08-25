@@ -35,5 +35,6 @@ def build_synthesizer(settings: Settings) -> QuerySynthesizer:
             model=settings.llm_model,
             api_key=settings.llm_api_key,
             reasoning_effort=settings.llm_reasoning_effort,
+            max_attempts=settings.llm_max_attempts,
         )
     return TemplateSynthesizer()

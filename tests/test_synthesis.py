@@ -326,3 +326,105 @@ def test_llm_synthesizer_falls_back_on_empty_content():
     result = synth.synthesize(KEYWORDS, context)
     assert result.text == _text(KEYWORDS, context)
     assert result.style == "template"
+
+
+# --- transient failures ------------------------------------------------------
+# Distinct from the 400 above: those mean the payload is wrong and retrying it
+# unchanged fails identically. These mean "not now", and a run of thousands of
+# sequential calls will meet them.
+
+_OK = {"choices": [{"message": {"content": "A real query."}}]}
+
+
+def _scripted(responses: list[httpx.Response], calls: list[httpx.Request]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return responses.pop(0) if responses else httpx.Response(200, json=_OK)
+
+    return handler
+
+
+def test_rate_limit_is_retried_and_the_row_keeps_its_llm_style():
+    calls: list[httpx.Request] = []
+    handler = _scripted(
+        [httpx.Response(429, json={"error": {"message": "Rate limit reached"}})], calls
+    )
+    synth = LLMSynthesizer(
+        "http://test/v1", "m", max_attempts=3, retry_backoff=0.0, client=_client(handler)
+    )
+
+    result = synth.synthesize(KEYWORDS, QueryContext(seed="x"))
+
+    assert result.style == "llm"  # a blip must not mislabel the row
+    assert result.text == "A real query."
+    assert len(calls) == 2
+
+
+def test_network_errors_are_retried_too():
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        raise httpx.ConnectError("connection refused")
+
+    synth = LLMSynthesizer(
+        "http://test/v1", "m", max_attempts=2, retry_backoff=0.0, client=_client(handler)
+    )
+
+    assert synth.synthesize(KEYWORDS, QueryContext(seed="x")).style == "template"
+    assert len(calls) == 2
+
+
+def test_exhausted_attempts_fall_back_and_say_why(caplog):
+    calls: list[httpx.Request] = []
+    handler = _scripted(
+        [httpx.Response(503, json={"error": {"message": "upstream unavailable"}})] * 3, calls
+    )
+    synth = LLMSynthesizer(
+        "http://test/v1", "m", max_attempts=3, retry_backoff=0.0, client=_client(handler)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = synth.synthesize(KEYWORDS, QueryContext(seed="x"))
+
+    assert result.style == "template"
+    assert len(calls) == 3
+    # The warning has to carry the endpoint's own words and the attempt count.
+    assert "upstream unavailable" in caplog.text
+    assert "after 3 attempts" in caplog.text
+
+
+def test_retry_after_header_overrides_the_computed_backoff(monkeypatch):
+    from keyword_extractor.synthesis import llm as llm_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(llm_module.time, "sleep", slept.append)
+    calls: list[httpx.Request] = []
+    handler = _scripted(
+        [
+            httpx.Response(
+                429, headers={"Retry-After": "2"}, json={"error": {"message": "slow down"}}
+            )
+        ],
+        calls,
+    )
+    synth = LLMSynthesizer(
+        "http://test/v1", "m", max_attempts=3, retry_backoff=30.0, client=_client(handler)
+    )
+
+    assert synth.synthesize(KEYWORDS, QueryContext(seed="x")).style == "llm"
+    assert slept == [2.0]  # the endpoint's instruction, not our 30s backoff
+
+
+def test_correcting_the_payload_costs_no_attempt():
+    """A dropped field is a fix, not a retry -- it must not spend the budget."""
+    sent: list[dict] = []
+    handler = _temperature_rejecting_handler(sent)
+    synth = LLMSynthesizer(
+        "http://test/v1", "m", max_attempts=1, retry_backoff=0.0, client=_client(handler)
+    )
+
+    result = synth.synthesize(KEYWORDS, QueryContext(seed="x"))
+
+    assert result.style == "llm"
+    assert len(sent) == 2  # two requests despite a single attempt

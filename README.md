@@ -33,7 +33,9 @@ to audit any row back to its source and to compare runs across parameter changes
 
 **Complexity levels.** Every supervisor and posting yields **three rows** — `low`, `medium`,
 `high` — from a single keyword extraction, so a run's row count is three times its source
-count (100 supervisors → 300 rows). The levels differ in kind, not just length: `low` takes
+count (100 supervisors → 300 rows). Both sources are sampled and both defaults are 25, so a
+bare `generate` produces 150 rows; `--posting-sample 0` takes the whole corpus (579 postings
+→ 1737 rows, hours under `--query-style llm`). The levels differ in kind, not just length: `low` takes
 the 2 strongest keywords in one short sentence, `medium` takes 4, and `high` takes 8 in a
 multi-sentence query that names the subject area and asks to combine the topics. Evaluation
 reports hit@k and MRR per level, which is the point of generating them: it measures what a
@@ -70,26 +72,61 @@ cd ../backend-core/demo && docker compose up -d && cd -
 ## Generate benchmark queries
 
 ```bash
-# Default scope: 25 sampled supervisors x <=20 recent pubs, plus all eligible postings.
+# Default scope: 25 sampled supervisors x <=20 recent pubs, plus 25 sampled postings.
 uv run --extra extraction keyword-extractor generate --out data/benchmark.jsonl
 
 # Hand-picked supervisors (best label quality; sidesteps the ORCID bug, see caveats):
-uv run --extra extraction keyword-extractor generate --supervisors "Doe, Jane" "Roe, Richard"
+uv run --extra extraction keyword-extractor generate \
+    --supervisor-names "Doe, Jane" "Roe, Richard"
 
 # Offline smoke run without a model download:
-KEYBERT_MODEL=fake uv run keyword-extractor generate --sample 3
+KEYBERT_MODEL=fake uv run keyword-extractor generate --supervisor-sample 3
 ```
 
-Useful flags: `--sources publications,postings`, `--sample N` (0 = all), `--min-pubs`,
-`--max-pubs`, `--seed`, `--top-n`, `--query-style auto|template|llm`, and `--language` to
-restrict publications to one ISO 639-3 code (default: all languages).
+**Flags name the entity they scope**, because the earlier `--sample` / `--min-pubs` /
+`--max-pubs` read as if they controlled the same thing while controlling three different
+axes. The old spellings now exit with the name of their replacement.
+
+| flag | scopes |
+|---|---|
+| `--supervisor-sample N` | supervisors sampled; `0` = all |
+| `--supervisor-min-pubs N` | publications a supervisor needs to qualify as a candidate |
+| `--supervisor-max-pubs N` | most recent publications fed to KeyBERT per supervisor |
+| `--posting-sample N` | postings sampled; `0` = all 579 |
+| `--publication-language` | ISO 639-3 filter; publications only — postings carry no label |
+| `--supervisor-names …` | explicit names, skips sampling |
+| `--keyword-top-n N` | keyphrases kept per source (overrides `KEYBERT_TOP_N`) |
+
+`--seed` drives both samples. Also useful: `--sources publications,postings`,
+`--query-style auto|template|llm`, `--log-level`.
+
+**Progress.** Long runs print a row counter with an ETA to stderr every 25 rows, so an LLM
+run over thousands of sequential calls reads as working rather than hung:
+
+```
+supervisor candidates: 6573, sampled: 25
+publications 75/75 rows
+postings     25/1737 rows  eta 2h18m
+```
 
 LLM phrasing: set `LLM_BASE_URL` (e.g. `http://localhost:11434/v1` with backend-core's
 Ollama container, or an OpenAI-compatible API) — otherwise a deterministic template is used,
-which keeps runs byte-reproducible. Optional request fields the endpoint rejects are learned
-once per process and dropped: `temperature: 0` is refused outright by gpt-5 and o-series
-models, so it is sent, blamed, and omitted from every later request rather than failing every
-row. Set `LLM_REASONING_EFFORT=low` for reasoning models on large runs.
+which keeps runs byte-reproducible. Set `LLM_REASONING_EFFORT=low` for reasoning models on
+large runs.
+
+Two different failures are survived, and they are not the same problem:
+
+- **The payload is wrong** (400/422). Optional fields the endpoint rejects are learned once
+  per process and dropped — `temperature: 0` is refused outright by gpt-5 and o-series, so it
+  is sent, blamed, and omitted from every later request rather than failing every row.
+  Correcting the payload costs no attempt.
+- **The endpoint is momentarily unable** (429, 5xx, timeout). Retried up to `LLM_MAX_ATTEMPTS`
+  times with exponential backoff, honouring `Retry-After`. A run of thousands of sequential
+  calls will meet a blip, and without this one blip permanently downgrades a row to template
+  phrasing.
+
+Run at `--log-level info` (the default) to see both as they happen; `httpx`'s own per-request
+lines stay suppressed so the progress counter survives.
 
 ## Evaluate (trial retrieval rounds)
 
@@ -98,7 +135,8 @@ uv run --extra eval --extra extraction keyword-extractor evaluate \
     --benchmark data/benchmark.jsonl --top-k 10 --out data/eval_report.jsonl
 ```
 
-Prints hit@1 / hit@5 / hit@k and MRR, overall and split by publications vs postings;
+Prints hit@1 / hit@5 / hit@k and MRR, overall and split by publications vs postings and by
+complexity level;
 `--out` keeps per-row ranks so weak queries can be found and the KeyBERT/template
 parameters adjusted (the supervisor's "play around ... based on trial rounds" step).
 
@@ -119,7 +157,7 @@ uv run ruff check
 
 - **Gold-label noise (ORCID conflation).** backend-core's harvester has a known bug that
   attaches ~38k publications to wrong `uzh_authors` entries. Mitigations here: sampling
-  requires a resolved CRIS UUID by default, `--supervisors` allows hand-picking, and every
+  requires a resolved CRIS UUID by default, `--supervisor-names` allows hand-picking, and every
   row records its `source_ids` for audit. Headline numbers inherit this upstream noise.
 - **Deliberately independent keyword model.** KeyBERT runs
   `paraphrase-multilingual-MiniLM-L12-v2`, not the retrieval model (`BAAI/bge-m3`) —

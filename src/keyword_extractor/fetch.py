@@ -13,8 +13,9 @@ artefact.
 from __future__ import annotations
 
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import psycopg
 from pydantic import BaseModel
@@ -22,6 +23,8 @@ from pydantic import BaseModel
 from keyword_extractor.config import Settings
 
 _CONNECT_TIMEOUT = 5
+
+_T = TypeVar("_T")
 
 
 def connect(settings: Settings) -> psycopg.Connection:
@@ -162,14 +165,36 @@ def list_supervisor_candidates(
     return candidates
 
 
+def _reproducible_sample(
+    items: list[_T], n: int, *, key: Callable[[_T], str], seed: int
+) -> list[_T]:
+    """Seeded sample of n items; n <= 0 or n >= len means all.
+
+    Sorted by `key` before sampling, so which items are drawn depends on the
+    seed and the set, never on the order the database happened to return.
+    """
+    if n <= 0 or n >= len(items):
+        return list(items)
+    ordered = sorted(items, key=key)
+    return random.Random(seed).sample(ordered, n)
+
+
 def sample_supervisors(
     candidates: list[SupervisorCandidate], n: int, seed: int = 42
 ) -> list[SupervisorCandidate]:
-    """Reproducible sample of n candidates; n <= 0 or n >= len means all."""
-    if n <= 0 or n >= len(candidates):
-        return list(candidates)
-    ordered = sorted(candidates, key=lambda c: c.name)
-    return random.Random(seed).sample(ordered, n)
+    """Reproducible sample of n supervisor candidates; 0 means all."""
+    return _reproducible_sample(candidates, n, key=lambda c: c.name, seed=seed)
+
+
+def sample_postings(postings: list[PostingRow], n: int, seed: int = 42) -> list[PostingRow]:
+    """Reproducible sample of n postings; 0 means all.
+
+    A posting is a benchmark row in its own right -- unlike publications it is
+    not pooled under a supervisor -- so this is the only lever bounding how
+    much of the corpus a run touches. Without it `--supervisor-sample 1` still
+    walked all 579 postings.
+    """
+    return _reproducible_sample(postings, n, key=lambda p: p.id, seed=seed)
 
 
 def fetch_publications(
