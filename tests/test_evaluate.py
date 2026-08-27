@@ -86,3 +86,52 @@ def test_result_key_fallback_to_name():
 
     report = evaluate(rows, top_k=5, find=find)
     assert report.rows[0]["rank"] == 1
+
+
+def test_concurrency_preserves_row_order():
+    """Reassembly is by index, never by completion order."""
+    import random
+    import time
+
+    def find(query, top_k):
+        time.sleep(random.uniform(0, 0.01))
+        # Echo the query so the mapping from row to result is checkable.
+        return [{"supervisor": query}]
+
+    rows = [_row(query=f"q{i}", gold=f"q{i}") for i in range(24)]
+    report = evaluate(rows, top_k=5, find=find, concurrency=4)
+    assert [r["query"] for r in report.rows] == [f"q{i}" for i in range(24)]
+    # Every row matched its own echoed gold, so a shuffle would show as misses.
+    assert report.summary["overall"]["hit@1"] == 1.0
+
+
+def test_find_error_aborts_the_run():
+    """A failed call must not be averaged in as a miss."""
+    calls = []
+
+    def find(query, top_k):
+        calls.append(query)
+        if len(calls) == 3:
+            raise RuntimeError("matcher fell over")
+        return [{"supervisor": "Doe, Jane"}]
+
+    rows = [_row(query=f"q{i}", gold="Doe, Jane") for i in range(6)]
+    with pytest.raises(RuntimeError, match="matcher fell over"):
+        evaluate(rows, top_k=5, find=find)
+
+
+def test_matcher_client_satisfies_the_find_seam():
+    """The real client, over a mock transport, is a drop-in FindFn."""
+    import httpx
+
+    from keyword_extractor.matcher_client import MatcherClient
+
+    def handler(request):
+        return httpx.Response(200, json={"matches": [{"supervisor": "Doe, Jane"}]})
+
+    client = MatcherClient(
+        base_url="http://matcher.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    report = evaluate([_row(query="q", gold="Doe, Jane")], top_k=5, find=client.match)
+    assert report.summary["overall"]["hit@1"] == 1.0

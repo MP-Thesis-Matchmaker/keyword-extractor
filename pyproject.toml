@@ -18,18 +18,19 @@ dependencies = [
 
 [project.optional-dependencies]
 # KeyBERT pulls sentence-transformers -> torch. Kept out of the default install
-# so CI and the fake extractor need no model download (same split backend-core
-# makes with its `embeddings` extra). Torch bounds copied from backend-core to
-# keep both repos on the same torch minor.
+# so CI and the fake extractor need no model download (the same split
+# backend-core makes with themis-matcher's `embeddings` extra, in
+# projects/matcher). Torch bounds copied from there to keep both repos on the
+# same torch minor.
+#
+# There is deliberately no `eval` extra. Evaluation used to import backend-core
+# in-process through a path dependency, which meant a sibling checkout and a
+# torch install just to score a benchmark. It now calls the matcher's HTTP API
+# instead, which needs nothing beyond httpx above.
 extraction = [
     "keybert>=0.9",
     "sentence-transformers>=5.6",
     "torch>=2.6,<2.13",
-]
-# Trial retrieval imports backend-core directly (sibling checkout under repos/).
-# [embeddings] because evaluation embeds queries with the real bge-m3 model.
-eval = [
-    "thesis-matchmaker[embeddings]",
 ]
 
 [dependency-groups]
@@ -47,7 +48,6 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
-thesis-matchmaker = { path = "../backend-core" }
 
 [project.scripts]
 keyword-extractor = "keyword_extractor.cli:main"

@@ -30,3 +30,8 @@ def isolate_settings(monkeypatch):
     # not spend the retry backoff. Retry behaviour is tested directly, with an
     # injected transport and zero backoff.
     monkeypatch.setenv("LLM_MAX_ATTEMPTS", "1")
+    # .invalid is the reserved TLD: a call that escapes a stub dies on DNS in
+    # milliseconds instead of hanging, or -- worse -- reaching a real matcher
+    # someone happens to have running on 8100.
+    monkeypatch.setenv("MATCHER_BASE_URL", "http://matcher.invalid")
+    monkeypatch.setenv("MATCHER_MAX_ATTEMPTS", "1")

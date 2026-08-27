@@ -1,9 +1,12 @@
 """SQL builders and pure helpers -- no database."""
 
 from keyword_extractor.fetch import (
+    AuthorAuthority,
     PostingRow,
     PostingSupervisor,
     SupervisorCandidate,
+    cris_uuid_for,
+    list_supervisor_candidates,
     parse_posting_supervisors,
     postings_query,
     publications_query,
@@ -20,6 +23,19 @@ def test_supervisor_candidates_query_predicates():
     assert "p.language = %(language)s" in sql
     assert "count(*) >= %(min_publications)s" in sql
     assert params == {"min_publications": 3, "language": "eng"}
+
+
+def test_supervisor_candidates_query_reads_into_the_typed_authority():
+    """The map holds objects, so the id has to be read from inside the value.
+
+    The regression this pins: `->> name` returns the whole
+    `{"type": ..., "id": ...}` object serialized as text, which looks like a
+    populated column and is not a UUID.
+    """
+    sql, _ = supervisor_candidates_query(min_publications=1, language=None)
+    assert "p.author_authority_map -> name ->> 'id'" in sql
+    assert "p.author_authority_map -> name ->> 'type'" in sql
+    assert "author_authority_map ->> name" not in sql
 
 
 def test_supervisor_candidates_query_without_language():
@@ -104,3 +120,63 @@ def test_sample_postings_zero_means_all():
     postings = _postings(3)
     assert sample_postings(postings, 0) == postings
     assert sample_postings(postings, 99) == postings
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params):
+        self.sql, self.params = sql, params
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def cursor(self):
+        return _FakeCursor(self._rows)
+
+
+_ROWS = [
+    ("Doe, Jane", "uuid-doe", "cris", 7),
+    ("Foreign, Fred", "0000-0002-1825-0097", "orcid", 4),
+    ("Nameless, Nick", None, None, 3),
+]
+
+
+def test_list_supervisor_candidates_drops_non_cris_authority():
+    pool = list_supervisor_candidates(_FakeConn(_ROWS), require_cris_uuid=True)
+    assert [c.name for c in pool.candidates] == ["Doe, Jane"]
+    assert pool.total == 3
+    assert pool.cris_typed == 1
+
+
+def test_list_supervisor_candidates_never_reports_an_orcid_as_a_cris_uuid():
+    """An orcid-typed entry carries an id too; it must not reach `cris_uuid`."""
+    pool = list_supervisor_candidates(_FakeConn(_ROWS), require_cris_uuid=False)
+    by_name = {c.name: c for c in pool.candidates}
+    assert by_name["Foreign, Fred"].cris_uuid is None
+    assert by_name["Foreign, Fred"].authority_type == "orcid"
+    assert by_name["Doe, Jane"].cris_uuid == "uuid-doe"
+
+
+def test_cris_uuid_for_ignores_orcid_and_missing_entries():
+    authority_map = {
+        "Doe, Jane": AuthorAuthority(type="cris", id="uuid-doe"),
+        "Foreign, Fred": AuthorAuthority(type="orcid", id="0000-0002-1825-0097"),
+        "Nameless, Nick": None,
+    }
+    assert cris_uuid_for(authority_map, "Doe, Jane") == "uuid-doe"
+    assert cris_uuid_for(authority_map, "Foreign, Fred") is None
+    assert cris_uuid_for(authority_map, "Nameless, Nick") is None
+    assert cris_uuid_for(authority_map, "Absent, Alice") is None
