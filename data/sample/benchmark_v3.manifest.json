@@ -1,0 +1,41 @@
+{
+  "generated_at": "2026-08-27T08:58:25.439381+00:00",
+  "schema_fingerprint": "032028c3e280",
+  "corpus": {
+    "publications": 214756,
+    "publications_with_uzh_authors": 53545,
+    "distinct_uzh_author_names": 2942,
+    "postings": 695
+  },
+  "index": null,
+  "run": {
+    "argv": [
+      "generate",
+      "--out",
+      "data/sample/benchmark_v3.jsonl",
+      "--supervisor-sample",
+      "60",
+      "--posting-sample",
+      "30",
+      "--seed",
+      "42",
+      "--query-style",
+      "llm"
+    ],
+    "rows": 270,
+    "seed": 42,
+    "keybert_model": "paraphrase-multilingual-MiniLM-L12-v2",
+    "keybert_top_n": 8,
+    "supervisor_sample": 60,
+    "supervisor_min_pubs": 3,
+    "supervisor_max_pubs": 20,
+    "posting_sample": 30,
+    "publication_language": null,
+    "require_cris_uuid": true,
+    "query_style": "llm",
+    "sources": [
+      "postings",
+      "publications"
+    ]
+  }
+}

@@ -14,22 +14,37 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from keyword_extractor.benchmark import BenchmarkRow, GoldSupervisor, read_jsonl, write_jsonl
+from keyword_extractor.benchmark import (
+    BenchmarkManifest,
+    BenchmarkRow,
+    GoldSupervisor,
+    manifest_path,
+    read_jsonl,
+    read_manifest,
+    utc_now,
+    write_jsonl,
+    write_manifest,
+)
 from keyword_extractor.cleaning import prepare_text
 from keyword_extractor.config import Settings, get_settings
 from keyword_extractor.extraction import KeywordExtractor, aggregate_keywords, build_extractor
 from keyword_extractor.fetch import (
+    CRIS,
     PostingRow,
     PublicationRow,
     SupervisorCandidate,
     connect,
+    corpus_stats,
+    cris_uuid_for,
     fetch_postings,
     fetch_publications,
     list_supervisor_candidates,
     sample_postings,
     sample_supervisors,
+    schema_fingerprint,
 )
 from keyword_extractor.language import detect_language
+from keyword_extractor.matcher_client import MatcherClient, MatcherError
 from keyword_extractor.synthesis import (
     COMPLEXITIES,
     QueryContext,
@@ -177,13 +192,24 @@ def _pick_synthesizer(settings: Settings, requested: str) -> QuerySynthesizer:
 
 
 def _resolve_cris_uuid(cand: SupervisorCandidate, pubs: list[PublicationRow]) -> str | None:
+    """The supervisor\'s CRIS Person UUID, from the candidate row or any publication.
+
+    `cris_uuid_for` rather than a plain map lookup: an orcid-typed authority also
+    carries an id, and writing that into a field named cris_uuid is how a gold
+    label starts claiming a Person that does not exist.
+    """
     if cand.cris_uuid:
         return cand.cris_uuid
     for pub in pubs:
-        uuid = pub.author_authority_map.get(cand.name)
+        uuid = cris_uuid_for(pub.author_authority_map, cand.name)
         if uuid:
             return uuid
     return None
+
+
+def build_matcher_client(settings: Settings, *, base_url: str | None = None) -> MatcherClient:
+    """Constructed through a module-level function so tests can substitute a stub."""
+    return MatcherClient(settings, base_url=base_url)
 
 
 def _most_common(values: list[str | None]) -> str | None:
@@ -204,16 +230,20 @@ def _supervisor_rows(
             for name in args.supervisor_names
         ]
     else:
-        candidates = list_supervisor_candidates(
+        pool = list_supervisor_candidates(
             conn,
             min_publications=args.supervisor_min_pubs,
             language=args.publication_language,
+            require_cris_uuid=args.require_cris_uuid,
         )
-        chosen = sample_supervisors(candidates, args.supervisor_sample, seed=args.seed)
+        chosen = sample_supervisors(pool.candidates, args.supervisor_sample, seed=args.seed)
         # stderr, with the progress counter: it is status, and mixing the two
         # streams reorders them the moment the run is piped to a file.
+        # `cris-typed` below `candidates` is the eligibility invariant: equal
+        # numbers mean upstream still admits only registered UZH researchers.
         print(
-            f"supervisor candidates: {len(candidates)}, sampled: {len(chosen)}",
+            f"supervisor candidates: {pool.total}, cris-typed: {pool.cris_typed}, "
+            f"sampled: {len(chosen)}",
             file=sys.stderr,
             flush=True,
         )
@@ -272,7 +302,13 @@ def _supervisor_rows(
                     keywords=select_keywords(keywords, complexity),
                     source_type="publication",
                     source_ids=[p.id for p in pubs],
-                    gold_supervisors=[GoldSupervisor(name=cand.name, cris_uuid=cris_uuid)],
+                    gold_supervisors=[
+                        GoldSupervisor(
+                            name=cand.name,
+                            cris_uuid=cris_uuid,
+                            authority_type=cand.authority_type or (CRIS if cris_uuid else None),
+                        )
+                    ],
                     granularity="supervisor",
                     query_style=result.style,
                     complexity=complexity,
@@ -356,6 +392,51 @@ def _posting_rows(
     return rows
 
 
+def _warn_on_index_drift(
+    manifest: BenchmarkManifest | None, index: dict, benchmark: str
+) -> None:
+    """Say so when the benchmark was generated against a different index.
+
+    Deliberately not a check against the live database's schema fingerprint:
+    evaluation no longer opens a connection, and reintroducing one to validate a
+    manifest would undo the point of the HTTP migration. The realistic failure
+    is evaluating an old benchmark against a re-indexed matcher, and that is
+    visible from the manifest alone.
+    """
+    if manifest is None:
+        print(
+            f"NOTE: {benchmark} has no run manifest, so the corpus its gold "
+            "labels came from is unrecorded. Regenerate it to get one.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    was = (manifest.index or {}).get("embedding_model")
+    now = index.get("embedding_model")
+    if was and now and was != now:
+        print(
+            f"WARNING: this benchmark was generated against an index built with {was}, "
+            f"but the matcher answering is on {now}. The scores are not comparable "
+            "with earlier runs of the same file.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _index_status_if_reachable(settings: Settings) -> dict | None:
+    """The matcher's index status, or None when there is no matcher to ask.
+
+    Generation does not need a matcher, so its absence is not an error. Recording
+    the index when one *is* running makes a generate/evaluate pair traceable to
+    the same state of the system.
+    """
+    try:
+        with build_matcher_client(settings) as client:
+            return client.index_status()
+    except MatcherError:
+        return None
+
+
 def _generate(args: argparse.Namespace) -> int:
     # "all" and "" are spellings of "no language filter"; the keyword model is
     # multilingual, so restricting the corpus is now the special case.
@@ -377,10 +458,40 @@ def _generate(args: argparse.Namespace) -> int:
             rows.extend(_supervisor_rows(conn, extractor, synthesizer, settings, args))
         if "postings" in sources:
             rows.extend(_posting_rows(conn, extractor, synthesizer, settings, args))
+        # Read inside the same connection as the rows themselves, so the
+        # manifest describes the corpus these labels actually came from.
+        corpus = corpus_stats(conn, min_publications=args.supervisor_min_pubs)
+        fingerprint = schema_fingerprint(conn)
 
-    count = write_jsonl(rows, Path(args.out))
+    out_path = Path(args.out)
+    count = write_jsonl(rows, out_path)
+    write_manifest(
+        BenchmarkManifest(
+            generated_at=utc_now(),
+            schema_fingerprint=fingerprint,
+            corpus=corpus,
+            index=_index_status_if_reachable(settings),
+            run={
+                "argv": sys.argv[1:],
+                "rows": count,
+                "seed": args.seed,
+                "keybert_model": settings.keybert_model,
+                "keybert_top_n": settings.keybert_top_n,
+                "supervisor_sample": args.supervisor_sample,
+                "supervisor_min_pubs": args.supervisor_min_pubs,
+                "supervisor_max_pubs": args.supervisor_max_pubs,
+                "posting_sample": args.posting_sample,
+                "publication_language": args.publication_language,
+                "require_cris_uuid": args.require_cris_uuid,
+                "query_style": args.query_style,
+                "sources": sorted(sources),
+            },
+        ),
+        out_path,
+    )
     by_type = Counter(r.source_type for r in rows)
     print(f"wrote {count} benchmark rows to {args.out} ({dict(by_type)})", flush=True)
+    print(f"wrote run manifest to {manifest_path(out_path)}", flush=True)
     # A degraded run must be visible in the summary, not only in a log line
     # scrolled past 300 rows ago.
     fell_back = sum(1 for r in rows if r.query_style == "template")
@@ -393,24 +504,80 @@ def _generate(args: argparse.Namespace) -> int:
     return 0
 
 
+# Two separate ceilings, and the lower one is not the documented one.
+#
+# The documented ceiling is the matcher's psycopg pool (max_size=5, synchronous
+# routes), so a fifth concurrent DB-touching request meets PoolTimeout. 4 leaves
+# one connection for the preflight.
+#
+# The real ceiling, measured against the running matcher, is 1. Uvicorn dispatches
+# sync `def` routes to a threadpool, and every one of them embeds the query with a
+# process-wide SentenceTransformer whose HuggingFace fast tokenizer is Rust-backed
+# and not thread-safe: two concurrent queries reconfiguring its truncation and
+# padding race, and the loser gets `RuntimeError: Already borrowed` -> 500. That is
+# an upstream bug, not something a client can work around, which is why the default
+# is 1 and why --concurrency carries a warning rather than being removed.
+_MAX_CONCURRENCY = 4
+
+
 def _evaluate(args: argparse.Namespace) -> int:
     from keyword_extractor.evaluate import evaluate
 
     rows = read_jsonl(Path(args.benchmark))
     if not rows:
         raise SystemExit(f"no rows in {args.benchmark}")
-    try:
-        report = evaluate(rows, top_k=args.top_k)
-    finally:
-        # backend-core keeps module-level connection pools whose worker threads
-        # otherwise whine at interpreter shutdown; close them when present.
-        try:
-            from thesis_matchmaker.db import close_pools
 
-            close_pools()
-        except ImportError:
-            pass
-    print(json.dumps(report.summary, indent=2))
+    settings = get_settings()
+    concurrency = args.concurrency if args.concurrency is not None else settings.matcher_concurrency
+    if concurrency > _MAX_CONCURRENCY:
+        print(
+            f"WARNING: --concurrency {concurrency} exceeds the matcher's connection pool "
+            f"(max_size=5, synchronous routes); clamping to {_MAX_CONCURRENCY}",
+            file=sys.stderr,
+            flush=True,
+        )
+        concurrency = _MAX_CONCURRENCY
+    concurrency = max(1, concurrency)
+    if concurrency > 1:
+        print(
+            f"WARNING: --concurrency {concurrency} is above 1. The matcher embeds every "
+            "query with a shared HuggingFace fast tokenizer that is not thread-safe, and "
+            "returns 500 (RuntimeError: Already borrowed) when two queries race. Expect "
+            "the run to abort.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    client = build_matcher_client(settings, base_url=args.matcher_base_url)
+    try:
+        # Preflight before the first query: a run that cannot say which index
+        # answered is not reproducible, and a matcher with no index should cost
+        # one second rather than one timeout per row.
+        try:
+            index = client.index_status()
+        except MatcherError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(
+            f"matcher {client.base_url}: {index.get('embedding_model')} "
+            f"dim {index.get('embedding_dim')}, {index.get('document_count')} documents "
+            f"from {index.get('sources')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        manifest = read_manifest(Path(args.benchmark))
+        _warn_on_index_drift(manifest, index, args.benchmark)
+        report = evaluate(
+            rows, top_k=args.top_k, find=client.match, concurrency=concurrency
+        )
+    finally:
+        client.close()
+
+    print(
+        json.dumps(
+            {"index": index, "label": args.label, "summary": report.summary},
+            indent=2,
+        )
+    )
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -456,6 +623,15 @@ def main(argv: list[str] | None = None) -> int:
         help="most recent publications fed to KeyBERT per supervisor; 0 = all",
     )
     gen.add_argument(
+        "--require-cris-uuid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep only supervisors whose authority is CRIS-typed, i.e. that resolve "
+        "to a person row. Drops nothing on the current corpus -- backend-core "
+        "already restricts uzh_authors to registered UZH researchers -- so the "
+        "printed candidate/cris-typed pair is really an invariant check",
+    )
+    gen.add_argument(
         "--posting-sample", type=int, default=25, help="postings to sample; 0 = all"
     )
     gen.add_argument(
@@ -479,6 +655,28 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--benchmark", default="data/benchmark.jsonl")
     ev.add_argument("--top-k", type=int, default=10)
     ev.add_argument("--out", default=None, help="optional per-row results JSONL")
+    ev.add_argument(
+        "--matcher-base-url",
+        default=None,
+        help="matcher HTTP API to evaluate against; overrides MATCHER_BASE_URL, so a "
+        "run can be pointed at a differently configured matcher without editing .env",
+    )
+    ev.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help=f"concurrent /v1/match calls (default MATCHER_CONCURRENCY=1). Clamped to "
+        f"{_MAX_CONCURRENCY} by the matcher's connection pool, but anything above 1 is "
+        "currently unsafe: the matcher embeds queries with a shared, non-thread-safe "
+        "tokenizer and returns 500 (RuntimeError: Already borrowed) under concurrency",
+    )
+    ev.add_argument(
+        "--label",
+        default=None,
+        help="free-text note recorded in the report, e.g. the matcher's retrieval "
+        "regime. GET /v1/index/status reports the index but not whether the server "
+        "was configured to require a UZH author, so that has to be recorded here",
+    )
     _add_log_level(ev)
 
     args = parser.parse_args(argv)

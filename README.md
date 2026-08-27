@@ -24,7 +24,7 @@ Postgres (backend-core's DB)
                                                     ▼
                             data/benchmark.jsonl  (query + gold supervisors)
                                                     ▼
-                            evaluate: backend-core VectorRetriever → hit@k, MRR
+                            evaluate: POST /v1/match (themis-matcher) → hit@k, MRR
 ```
 
 Each benchmark row records the query, the extracted keywords, the source publication/posting
@@ -67,6 +67,15 @@ uv sync                   # base install: no torch, tests run offline
 
 # Start the pre-loaded database (214k publications, 695 postings, built index):
 cd ../backend-core/demo && docker compose up -d && cd -
+```
+
+`evaluate` additionally needs the matcher's HTTP API running. It is a separate process and
+a separate install — nothing from backend-core is imported here:
+
+```bash
+cd ../backend-core
+uv sync --package themis-matcher --extra embeddings
+uv run themis-matcher serve          # 127.0.0.1:8100 by default
 ```
 
 ## Generate benchmark queries
@@ -131,7 +140,7 @@ lines stay suppressed so the progress counter survives.
 ## Evaluate (trial retrieval rounds)
 
 ```bash
-uv run --extra eval --extra extraction keyword-extractor evaluate \
+uv run keyword-extractor evaluate \
     --benchmark data/benchmark.jsonl --top-k 10 --out data/eval_report.jsonl
 ```
 
@@ -140,11 +149,26 @@ complexity level;
 `--out` keeps per-row ranks so weak queries can be found and the KeyBERT/template
 parameters adjusted (the supervisor's "play around ... based on trial rounds" step).
 
-Evaluation imports backend-core directly (`[tool.uv.sources]` path dependency, so
-`../backend-core` must be checked out) and builds the **real** `VectorRetriever`
-explicitly — it refuses to run when no index manifest exists rather than silently
-benchmarking backend-core's canned `FakeRetriever`. Run from the repo root: both this
-package and backend-core read `.env` from the current directory.
+No extras: evaluation runs off the base install. It used to import backend-core in-process
+through a uv path dependency, which meant a sibling checkout, a psycopg pool and a 2.27 GB
+embedding model loaded here just to score a benchmark. Retrieval is an HTTP call to the
+matcher now, which owns all three.
+
+Before the first query it preflights `GET /v1/index/status` and prints which index is about
+to answer — model, dimension, document count — and records it in the report. A matcher with
+no index fails the run in a second rather than after one timeout per row, with a message
+naming the command that builds one. `--matcher-base-url` points a single run at a
+differently configured matcher; `--label` records what that configuration was, since the
+status endpoint reports the index but not the server's retrieval settings.
+
+`--concurrency` parallelises the queries and is **clamped to 4** — but leave it at 1. The
+documented ceiling is the matcher's connection pool (`max_size=5`, synchronous routes), and
+the real one is lower: uvicorn dispatches those sync routes to a threadpool where they share
+a single `SentenceTransformer`, whose HuggingFace fast tokenizer is Rust-backed and not
+thread-safe. Two concurrent queries reconfiguring its truncation race, and one gets
+`RuntimeError: Already borrowed`, which the API returns as a 500 (observed against
+`themis-matcher serve` at concurrency 4). That is an upstream bug, so the flag stays, warns
+above 1, and defaults to 1.
 
 ## Tests
 
@@ -155,10 +179,22 @@ uv run ruff check
 
 ## Caveats
 
-- **Gold-label noise (ORCID conflation).** backend-core's harvester has a known bug that
-  attaches ~38k publications to wrong `uzh_authors` entries. Mitigations here: sampling
-  requires a resolved CRIS UUID by default, `--supervisor-names` allows hand-picking, and every
-  row records its `source_ids` for audit. Headline numbers inherit this upstream noise.
+- **Gold labels are tied to an attribution regime.** backend-core once admitted any DSpace
+  authority into `uzh_authors`, conflating CRIS Person UUIDs with bare ORCIDs and making
+  co-authors at other universities look supervisor-eligible. That is fixed upstream
+  (`uzh_authors` now means "registered UZH researcher"), and the correction was large:
+  publications with a UZH author fell 91,729 → 53,545, and distinct names 58,218 → 2,942.
+  **It also invalidated the first benchmark**: 87 of `benchmark_v2.jsonl`'s 105 gold
+  supervisors are no longer supervisor-eligible at all, so they cannot be retrieved and every
+  score computed from that file understates the system. `benchmark_v2.jsonl` is kept as the
+  pre-fix artefact; `benchmark_v3.jsonl` is the current set.
+
+  Nothing in v2 revealed this, because a row recorded the extractor and nothing about the
+  corpus. Every generate run now writes a `*.manifest.json` sidecar carrying the database's
+  schema fingerprint, the corpus counts, and the run's parameters, so a diff of two manifests
+  answers "did the ground truth move?". `--require-cris-uuid` (on by default) drops nothing
+  today; the candidate/cris-typed pair printed by `generate` is the invariant that would show
+  it moving again.
 - **Deliberately independent keyword model.** KeyBERT runs
   `paraphrase-multilingual-MiniLM-L12-v2`, not the retrieval model (`BAAI/bge-m3`) —
   extracting keywords in the system-under-test's own embedding space would measure the
@@ -186,5 +222,6 @@ uv run ruff check
 - **Personal data.** The DB and the generated files contain researchers' names. Supervisor
   emails are stripped at fetch time and never written; `data/` is gitignored and the
   benchmark bundle stays within the project team.
-- macOS: keep `EMBEDDING_DEVICE=cpu` in `.env` for the eval step (mps aborts without a
-  traceback when memory is short).
+- macOS: the mps-aborts-without-a-traceback problem belongs to whoever runs
+  `themis-matcher serve` (set `MATCHER_EMBEDDING_DEVICE=cpu` there). This process never loads
+  an embedding model for retrieval.

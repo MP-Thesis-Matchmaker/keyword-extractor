@@ -8,6 +8,7 @@ import pytest
 import keyword_extractor.cli as cli
 from keyword_extractor.benchmark import read_jsonl
 from keyword_extractor.fetch import PostingRow, PostingSupervisor, PublicationRow
+from keyword_extractor.matcher_client import IndexNotBuiltError
 
 _PUBS = [
     PublicationRow(
@@ -15,7 +16,7 @@ _PUBS = [
         title="Auction theory and mechanism design",
         abstract="<p>We study auctions &amp; equilibria in large markets.</p>",
         uzh_authors=["Doe, Jane"],
-        author_authority_map={"Doe, Jane": "uuid-doe"},
+        author_authority_map={"Doe, Jane": {"type": "cris", "id": "uuid-doe"}},
         year=2024,
         department="Department of Economics",
         language="eng",
@@ -25,7 +26,7 @@ _PUBS = [
         title="Market equilibria under uncertainty",
         abstract="Equilibria in auction markets   with noisy signals.",
         uzh_authors=["Doe, Jane"],
-        author_authority_map={"Doe, Jane": "uuid-doe"},
+        author_authority_map={"Doe, Jane": {"type": "cris", "id": "uuid-doe"}},
         year=2023,
         department="Department of Economics",
         language="eng",
@@ -66,7 +67,7 @@ _GERMAN_PUBS = [
         "auf lokaler Ebene anders ablaufen als bei bundespolitischen Entscheidungen und dass "
         "die Rezipienten dabei über weniger Wissen verfügen.",
         uzh_authors=["Udris, Linards"],
-        author_authority_map={"Udris, Linards": "uuid-udris"},
+        author_authority_map={"Udris, Linards": {"type": "cris", "id": "uuid-udris"}},
         year=2022,
         department="Institut für Kommunikationswissenschaft",
         language="deu",
@@ -78,7 +79,7 @@ _GERMAN_PUBS = [
         "öffentlichen Kommunikation auswirkt und welche Folgen sich daraus für die "
         "Meinungsbildung ergeben.",
         uzh_authors=["Udris, Linards"],
-        author_authority_map={"Udris, Linards": "uuid-udris"},
+        author_authority_map={"Udris, Linards": {"type": "cris", "id": "uuid-udris"}},
         year=2021,
         department="Institut für Kommunikationswissenschaft",
         language="deu",
@@ -88,13 +89,34 @@ _GERMAN_PUBS = [
         title="",
         abstract="   ",
         uzh_authors=["Udris, Linards"],
-        author_authority_map={"Udris, Linards": "uuid-udris"},
+        author_authority_map={"Udris, Linards": {"type": "cris", "id": "uuid-udris"}},
         year=2020,
         language="deu",
     ),
 ]
 
-_BY_SUPERVISOR = {"Doe, Jane": _PUBS, "Udris, Linards": _GERMAN_PUBS}
+# A supervisor whose only authority is an ORCID: DSpace records an id for them,
+# but it resolves to no `person` row, so nothing here may call it a CRIS UUID.
+_ORCID_PUBS = [
+    PublicationRow(
+        id="20.500.14742/9",
+        title="Retrieval-augmented generation for scientific abstracts",
+        abstract="Dense retrieval over scientific abstracts with reranking.",
+        uzh_authors=["Foreign, Fred"],
+        author_authority_map={
+            "Foreign, Fred": {"type": "orcid", "id": "0000-0002-1825-0097"}
+        },
+        year=2025,
+        department="Department of Informatics",
+        language="eng",
+    ),
+]
+
+_BY_SUPERVISOR = {
+    "Doe, Jane": _PUBS,
+    "Udris, Linards": _GERMAN_PUBS,
+    "Foreign, Fred": _ORCID_PUBS,
+}
 
 
 def _patch_db(monkeypatch):
@@ -103,6 +125,9 @@ def _patch_db(monkeypatch):
         cli, "fetch_publications", lambda conn, name, **kw: _BY_SUPERVISOR.get(name, [])
     )
     monkeypatch.setattr(cli, "fetch_postings", lambda conn, **kw: _POSTINGS)
+    # The manifest's corpus aggregates run on the same (absent) connection.
+    monkeypatch.setattr(cli, "corpus_stats", lambda conn, **kw: {"publications": 2})
+    monkeypatch.setattr(cli, "schema_fingerprint", lambda conn: "test-fingerprint")
 
 
 def test_generate_end_to_end(tmp_path, monkeypatch):
@@ -267,28 +292,120 @@ def test_generate_skips_supervisor_without_pubs(tmp_path, monkeypatch, capsys):
     assert "skipping" in capsys.readouterr().err
 
 
-def test_evaluate_cli_with_injected_report(tmp_path, monkeypatch, capsys):
+_INDEX_STATUS = {
+    "embedding_model": "BAAI/bge-m3",
+    "embedding_dim": 1024,
+    "document_count": 215451,
+    "sources": "postgres",
+}
+
+
+class _StubClient:
+    """Stands in for MatcherClient: answers the preflight and every query."""
+
+    base_url = "http://matcher.test"
+
+    def __init__(self, matches=None, status=None, error=None):
+        self._matches = matches or []
+        self._status = status or _INDEX_STATUS
+        self._error = error
+        self.queries = []
+        self.closed = False
+
+    def index_status(self):
+        if self._error:
+            raise self._error
+        return self._status
+
+    def match(self, query, top_k=5):
+        self.queries.append((query, top_k))
+        return self._matches
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _patch_matcher(monkeypatch, stub):
+    monkeypatch.setattr(cli, "build_matcher_client", lambda settings, base_url=None: stub)
+    return stub
+
+
+def _generate_bench(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("KEYBERT_MODEL", "fake")
     _patch_db(monkeypatch)
     bench = tmp_path / "bench.jsonl"
     cli.main(["generate", "--out", str(bench), "--supervisor-names", "Doe, Jane"])
     capsys.readouterr()  # discard generate output
+    return bench
 
-    import keyword_extractor.evaluate as evaluate_module
 
-    def fake_find(query, top_k):
-        # Every gold supervisor in the generated benchmark, German row included.
-        return [
-            {"supervisor": "Doe, Jane"},
-            {"supervisor": "Roe, Richard"},
-            {"supervisor": "Udris, Linards"},
-        ]
+def test_evaluate_cli_with_injected_report(tmp_path, monkeypatch, capsys):
+    bench = _generate_bench(tmp_path, monkeypatch, capsys)
+    stub = _patch_matcher(
+        monkeypatch,
+        _StubClient(
+            # Every gold supervisor in the generated benchmark, German row included.
+            matches=[
+                {"supervisor": "Doe, Jane"},
+                {"supervisor": "Roe, Richard"},
+                {"supervisor": "Udris, Linards"},
+            ]
+        ),
+    )
 
-    monkeypatch.setattr(evaluate_module, "_default_find", lambda: fake_find)
     rc = cli.main(["evaluate", "--benchmark", str(bench), "--top-k", "5"])
     assert rc == 0
-    summary = json.loads(capsys.readouterr().out)
-    assert summary["overall"]["hit@5"] == 1.0
+    report = json.loads(capsys.readouterr().out)
+    assert report["summary"]["overall"]["hit@5"] == 1.0
+    assert stub.closed
+
+
+def test_evaluate_report_records_which_index_answered(tmp_path, monkeypatch, capsys):
+    """A score that cannot name the index that produced it is not reproducible."""
+    bench = _generate_bench(tmp_path, monkeypatch, capsys)
+    _patch_matcher(monkeypatch, _StubClient(matches=[{"supervisor": "Doe, Jane"}]))
+
+    rc = cli.main(
+        ["evaluate", "--benchmark", str(bench), "--label", "require_uzh_author=true"]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert report["index"] == _INDEX_STATUS
+    assert report["label"] == "require_uzh_author=true"
+    # And on stderr, before any query ran.
+    assert "BAAI/bge-m3" in captured.err
+
+
+def test_evaluate_preflight_failure_exits_before_any_query(tmp_path, monkeypatch, capsys):
+    bench = _generate_bench(tmp_path, monkeypatch, capsys)
+    stub = _patch_matcher(
+        monkeypatch,
+        _StubClient(error=IndexNotBuiltError("the matcher has no index; themis-matcher index")),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["evaluate", "--benchmark", str(bench)])
+    assert "themis-matcher index" in str(excinfo.value)
+    assert stub.queries == []
+    assert stub.closed
+
+
+def test_evaluate_clamps_concurrency_to_the_pool_ceiling(tmp_path, monkeypatch, capsys):
+    bench = _generate_bench(tmp_path, monkeypatch, capsys)
+    _patch_matcher(monkeypatch, _StubClient(matches=[{"supervisor": "Doe, Jane"}]))
+
+    rc = cli.main(["evaluate", "--benchmark", str(bench), "--concurrency", "12"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "clamping to 4" in err
 
 
 def test_posting_sample_bounds_the_run(tmp_path, monkeypatch):
@@ -360,3 +477,30 @@ def test_renamed_flags_name_their_replacement(monkeypatch):
         with pytest.raises(SystemExit) as excinfo:
             cli.main(["generate", old, "1"])
         assert new in str(excinfo.value)
+
+
+def test_orcid_only_supervisor_gets_no_cris_uuid(tmp_path, monkeypatch):
+    """An ORCID is an id, but not a Person id -- the gold label must stay empty."""
+    monkeypatch.setenv("KEYBERT_MODEL", "fake")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    _patch_db(monkeypatch)
+    out = tmp_path / "bench.jsonl"
+
+    rc = cli.main(
+        [
+            "generate",
+            "--out",
+            str(out),
+            "--sources",
+            "publications",
+            "--supervisor-names",
+            "Foreign, Fred",
+        ]
+    )
+    assert rc == 0
+
+    rows = read_jsonl(out)
+    assert rows
+    for row in rows:
+        assert row.gold_supervisors[0].name == "Foreign, Fred"
+        assert row.gold_supervisors[0].cris_uuid is None

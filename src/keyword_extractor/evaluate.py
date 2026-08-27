@@ -1,20 +1,29 @@
-"""Trial retrieval: run benchmark queries against the matchmaker and score them.
+"""Trial retrieval: run benchmark queries against the matcher and score them.
 
 hit@k and MRR of the gold supervisor in the ranked results. The retriever is
-reached through an injectable `find` callable so the metrics are testable
-without backend-core installed; the default builds the REAL VectorRetriever
-explicitly and refuses to run without an index manifest -- backend-core's
-`_default_pipeline` silently falls back to a FakeRetriever that returns three
-canned matches, which would benchmark noise without failing.
+reached through an injectable `find` callable, which keeps the metrics testable
+with no matcher and no network; the default calls the matcher's HTTP API.
+
+That default used to build backend-core's VectorRetriever in this process, and
+refused to start without an index manifest because backend-core would otherwise
+have fallen back to a FakeRetriever and benchmarked three canned matches. The
+manifest check has not gone away, it has moved: retrieval is a separate process
+now, so what has to be established up front is not "is there an index" but
+"WHICH index is about to answer". `keyword-extractor evaluate` asks
+`GET /v1/index/status` before the first query and records the answer in the
+report -- a score that does not name the index that produced it cannot be
+reproduced, which is exactly how the previous benchmark went stale unnoticed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 from keyword_extractor.benchmark import BenchmarkRow
+from keyword_extractor.matcher_client import MatcherClient
 
 # (query, top_k) -> ranked researcher dicts, each carrying a "supervisor" name.
 FindFn = Callable[[str, int], list[dict[str, Any]]]
@@ -45,17 +54,37 @@ def _metrics(row_results: list[dict[str, Any]], top_k: int) -> dict[str, float |
 
 
 def evaluate(
-    rows: Sequence[BenchmarkRow], *, top_k: int = 10, find: FindFn | None = None
+    rows: Sequence[BenchmarkRow],
+    *,
+    top_k: int = 10,
+    find: FindFn | None = None,
+    concurrency: int = 1,
 ) -> EvalReport:
     """Rank of the first gold supervisor per query, aggregated to hit@k / MRR.
 
     Matching is by casefolded name: retrieval output has no researcher UUID,
     so evaluation cannot be stricter than the system's own output vocabulary.
+
+    `concurrency` > 1 dispatches queries over a thread pool -- the calls are
+    network-bound, so this is most of the wall-clock in a real run. Results are
+    reassembled by index, never by completion order, so the per-row output file
+    is byte-identical whatever the threads do. At 1 no pool is created at all,
+    which keeps the offline tests single-threaded.
+
+    A `find` that raises aborts the run rather than recording a miss. A failed
+    call and a genuine miss are indistinguishable once both are `rank: None`,
+    and quietly averaging retrieval failures into hit@k understates the system
+    while looking like a result.
     """
     find = find or _default_find()
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            all_results = list(pool.map(lambda row: find(row.query, top_k), rows))
+    else:
+        all_results = [find(row.query, top_k) for row in rows]
+
     row_results: list[dict[str, Any]] = []
-    for row in rows:
-        results = find(row.query, top_k)
+    for row, results in zip(rows, all_results, strict=True):
         names = [str(r.get("supervisor") or r.get("name") or "").casefold() for r in results]
         gold = {g.name.casefold() for g in row.gold_supervisors}
         rank = next((i + 1 for i, name in enumerate(names) if name in gold), None)
@@ -84,20 +113,11 @@ def evaluate(
     return EvalReport(summary=summary, rows=row_results)
 
 
-def _default_find() -> FindFn:
-    """The real backend-core retriever; requires the `eval` extra and an index."""
-    from thesis_matchmaker.adapters.service import find_researchers
-    from thesis_matchmaker.config import get_settings
-    from thesis_matchmaker.indexing import read_manifest
-    from thesis_matchmaker.pipeline import Pipeline
-    from thesis_matchmaker.retrieval import build_retriever
+def _default_find(client: MatcherClient | None = None) -> FindFn:
+    """Retrieval through the matcher's HTTP API.
 
-    settings = get_settings()
-    if read_manifest(settings) is None:
-        raise RuntimeError(
-            "No index manifest found in the database -- refusing to evaluate against "
-            "the canned FakeRetriever. Build the index in backend-core first "
-            "(thesis-matchmaker index), or point DATABASE_URL at the demo DB."
-        )
-    pipeline = Pipeline(retriever=build_retriever(settings))
-    return lambda query, top_k: find_researchers(query, top_k=top_k, pipeline=pipeline)
+    No index check here: the CLI preflights `GET /v1/index/status` before the
+    first query, so a matcher with nothing indexed fails the run in a second
+    rather than on row one of several hundred.
+    """
+    return (client or MatcherClient()).match

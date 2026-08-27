@@ -1,9 +1,10 @@
 """LLM-backed query synthesis over an OpenAI-compatible chat endpoint.
 
 The retry machinery is adapted from backend-core's
-`src/thesis_matchmaker/llm.py`, which solved this exact problem first. It is
-copied rather than imported because backend-core is only installed under the
-`eval` extra, while synthesis has to work in the base install.
+`projects/matcher/src/themis_matcher/llm.py`, which solved this exact problem
+first. It is copied rather than imported because backend-core is not installed
+here at all -- the only thing this repo takes from it is the matcher's HTTP API,
+and that API has no query-synthesis endpoint to borrow.
 
 Two retries live here, and they are answers to different questions.
 
