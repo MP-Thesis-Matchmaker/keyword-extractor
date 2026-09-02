@@ -47,16 +47,16 @@ def main() -> int:
         n = len(rows)
         ranks = [r.get("rank") for r in rows]
 
-        def hit(k: int) -> float:
+        def hit(k: int, ranks: list = ranks, n: int = n) -> float:
             return sum(1 for r in ranks if r is not None and r <= k) / n
 
         mrr = sum(1.0 / r for r in ranks if r is not None) / n
 
         # Recall from recall_at if available
-        recall_5 = sum(
-            r.get("recall_at", {}).get(5, r.get("recall_at", {}).get("5", 0.0))
-            for r in rows
-        ) / n
+        recall_5 = (
+            sum(r.get("recall_at", {}).get(5, r.get("recall_at", {}).get("5", 0.0)) for r in rows)
+            / n
+        )
 
         arm_metrics[arm] = {
             "n": n,
@@ -68,7 +68,9 @@ def main() -> int:
         }
 
     # Print results table
-    header = f"{'Arm':<20} {'n':>4} {'hit@1':>7} {'hit@5':>7} {'hit@10':>7} {'MRR':>7} {'recall@5':>9}"
+    header = (
+        f"{'Arm':<20} {'n':>4} {'hit@1':>7} {'hit@5':>7} {'hit@10':>7} {'MRR':>7} {'recall@5':>9}"
+    )
     print(header)
     print("-" * len(header))
 
@@ -88,7 +90,7 @@ def main() -> int:
     if baseline:
         print()
         print("Deltas vs topic_only:")
-        print(f"{'Arm':<20} {'Δhit@1':>7} {'Δhit@5':>7} {'ΔMRR':>7}")
+        print(f"{'Arm':<20} {'d_hit@1':>7} {'d_hit@5':>7} {'d_MRR':>7}")
         print("-" * 45)
         for arm in ("plus_program", "plus_background", "full"):
             if arm not in arm_metrics:

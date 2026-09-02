@@ -38,6 +38,7 @@ def _clear_unsupported_cache():
     yield
     llm_module._UNSUPPORTED_FIELDS.clear()
 
+
 KEYWORDS = ["auction theory", "mechanism design", "market equilibria"]
 
 
@@ -233,9 +234,7 @@ def test_only_the_blamed_field_is_dropped():
             )
         return httpx.Response(200, json={"choices": [{"message": {"content": "Query."}}]})
 
-    synth = LLMSynthesizer(
-        "http://test/v1", "m", reasoning_effort="low", client=_client(handler)
-    )
+    synth = LLMSynthesizer("http://test/v1", "m", reasoning_effort="low", client=_client(handler))
     assert synth.synthesize(KEYWORDS, QueryContext(seed="x")).style == "llm"
     # reasoning_effort was blamed, so temperature must survive the retry.
     assert "temperature" in sent[1]

@@ -84,6 +84,12 @@ uv run themis-matcher serve          # 127.0.0.1:8100 by default
 # Default scope: 25 sampled supervisors x <=20 recent pubs, plus 25 sampled postings.
 uv run --extra extraction keyword-extractor generate --out data/benchmark.jsonl
 
+# Generate the 300-row difficulty baseline (150 supervisors, publications only):
+uv run --extra extraction keyword-extractor generate \
+    --supervisor-sample 150 --posting-sample 0 \
+    --difficulty-threshold 10 \
+    --out data/benchmark_v4.jsonl
+
 # Hand-picked supervisors (best label quality; sidesteps the ORCID bug, see caveats):
 uv run --extra extraction keyword-extractor generate \
     --supervisor-names "Doe, Jane" "Roe, Richard"
@@ -105,9 +111,42 @@ axes. The old spellings now exit with the name of their replacement.
 | `--publication-language` | ISO 639-3 filter; publications only — postings carry no label |
 | `--supervisor-names …` | explicit names, skips sampling |
 | `--keyword-top-n N` | keyphrases kept per source (overrides `KEYBERT_TOP_N`) |
+| `--difficulty-threshold N` | tags supervisors with `< N` publications as `hard`, else `easy` |
 
 `--seed` drives both samples. Also useful: `--sources publications,postings`,
 `--query-style auto|template|llm`, `--log-level`.
+
+## Evaluation Ablations
+
+Beyond standard queries, the generator supports two targeted ablation modes for the thesis.
+
+### 1. Specificity Ablation
+Tests if the embedding "smooths over" specific jargon by comparing a supervisor's *true* specialization against a *general* topic and a related but *adjacent* topic.
+
+```bash
+uv run --extra extraction keyword-extractor generate \
+    --specificity --seed 42 \
+    --supervisor-names "Sennrich, Rico" "Aepli, Noëmi" \
+    --adjacent "Sennrich, Rico=text summarisation" \
+    --adjacent "Aepli, Noëmi=dialectology" \
+    --general "Sennrich, Rico=natural language processing" \
+    --general "Aepli, Noëmi=natural language processing" \
+    --out data/specificity_v4.jsonl
+
+# Analyze the results after evaluating:
+uv run python scripts/analyze_specificity.py data/specificity_out_v4.jsonl
+```
+
+### 2. Student Background Ablation
+Tests if adding conversational student context (e.g., study programs, past experience) dilutes the core research topic. Generates 4 query variants per supervisor: `topic_only`, `plus_program`, `plus_background`, and `full`.
+
+```bash
+uv run --extra extraction keyword-extractor generate \
+    --ablation-background \
+    --supervisor-sample 25 --posting-sample 0 \
+    --seed 42 \
+    --out data/benchmark_ablation_v3.jsonl
+```
 
 **Progress.** Long runs print a row counter with an ETA to stderr every 25 rows, so an LLM
 run over thousands of sequential calls reads as working rather than hung:
@@ -144,8 +183,7 @@ uv run keyword-extractor evaluate \
     --benchmark data/benchmark.jsonl --top-k 10 --out data/eval_report.jsonl
 ```
 
-Prints hit@1 / hit@5 / hit@k and MRR, overall and split by publications vs postings and by
-complexity level;
+Prints hit@k, recall@k, and MRR, overall and split by publications vs postings, by complexity level, and by publication-count difficulty tier;
 `--out` keeps per-row ranks so weak queries can be found and the KeyBERT/template
 parameters adjusted (the supervisor's "play around ... based on trial rounds" step).
 
@@ -187,7 +225,7 @@ uv run ruff check
   **It also invalidated the first benchmark**: 87 of `benchmark_v2.jsonl`'s 105 gold
   supervisors are no longer supervisor-eligible at all, so they cannot be retrieved and every
   score computed from that file understates the system. `benchmark_v2.jsonl` is kept as the
-  pre-fix artefact; `benchmark_v3.jsonl` is the current set.
+  pre-fix artefact. Note that `benchmark_v3.jsonl` suffered from a split-identity bug where highly published researchers were fragmented into multiple records with small publication counts; `benchmark_v4.jsonl` is the current, fully unified set.
 
   Nothing in v2 revealed this, because a row recorded the extractor and nothing about the
   corpus. Every generate run now writes a `*.manifest.json` sidecar carrying the database's

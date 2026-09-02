@@ -6,7 +6,7 @@ import json
 import pytest
 
 import keyword_extractor.cli as cli
-from keyword_extractor.benchmark import read_jsonl
+from keyword_extractor.benchmark import BenchmarkManifest, read_jsonl
 from keyword_extractor.fetch import PostingRow, PostingSupervisor, PublicationRow
 from keyword_extractor.matcher_client import IndexNotBuiltError
 
@@ -103,9 +103,7 @@ _ORCID_PUBS = [
         title="Retrieval-augmented generation for scientific abstracts",
         abstract="Dense retrieval over scientific abstracts with reranking.",
         uzh_authors=["Foreign, Fred"],
-        author_authority_map={
-            "Foreign, Fred": {"type": "orcid", "id": "0000-0002-1825-0097"}
-        },
+        author_authority_map={"Foreign, Fred": {"type": "orcid", "id": "0000-0002-1825-0097"}},
         year=2025,
         department="Department of Informatics",
         language="eng",
@@ -122,7 +120,7 @@ _BY_SUPERVISOR = {
 def _patch_db(monkeypatch):
     monkeypatch.setattr(cli, "connect", lambda settings: contextlib.nullcontext(None))
     monkeypatch.setattr(
-        cli, "fetch_publications", lambda conn, name, **kw: _BY_SUPERVISOR.get(name, [])
+        cli, "fetch_publications", lambda conn, names, **kw: _BY_SUPERVISOR.get(names[0], [])
     )
     monkeypatch.setattr(cli, "fetch_postings", lambda conn, **kw: _POSTINGS)
     # The manifest's corpus aggregates run on the same (absent) connection.
@@ -206,9 +204,7 @@ def test_posting_language_is_detected_when_the_column_is_null(tmp_path, monkeypa
     out = tmp_path / "bench_postings.jsonl"
     assert cli.main(["generate", "--out", str(out), "--sources", "postings"]) == 0
 
-    rows = {
-        (r.source_ids[0], r.complexity): r for r in read_jsonl(out)
-    }
+    rows = {(r.source_ids[0], r.complexity): r for r in read_jsonl(out)}
     german = rows[("posting-2", "medium")]
     assert german.metadata["text_language"] == "deu"
     assert german.metadata["db_language"] is None  # never labelled in the DB
@@ -249,9 +245,9 @@ def test_language_all_is_a_synonym_for_no_filter(tmp_path, monkeypatch):
     monkeypatch.setenv("KEYBERT_MODEL", "fake")
     seen = {}
 
-    def fetch(conn, name, **kw):
+    def fetch(conn, names, **kw):
         seen["language"] = kw.get("language")
-        return _BY_SUPERVISOR.get(name, [])
+        return _BY_SUPERVISOR.get(names[0], [])
 
     _patch_db(monkeypatch)
     monkeypatch.setattr(cli, "fetch_publications", fetch)
@@ -372,9 +368,7 @@ def test_evaluate_report_records_which_index_answered(tmp_path, monkeypatch, cap
     bench = _generate_bench(tmp_path, monkeypatch, capsys)
     _patch_matcher(monkeypatch, _StubClient(matches=[{"supervisor": "Doe, Jane"}]))
 
-    rc = cli.main(
-        ["evaluate", "--benchmark", str(bench), "--label", "require_uzh_author=true"]
-    )
+    rc = cli.main(["evaluate", "--benchmark", str(bench), "--label", "require_uzh_author=true"])
     assert rc == 0
     captured = capsys.readouterr()
     report = json.loads(captured.out)
@@ -414,9 +408,7 @@ def test_posting_sample_bounds_the_run(tmp_path, monkeypatch):
     _patch_db(monkeypatch)
     out = tmp_path / "bench_one_posting.jsonl"
 
-    rc = cli.main(
-        ["generate", "--out", str(out), "--sources", "postings", "--posting-sample", "1"]
-    )
+    rc = cli.main(["generate", "--out", str(out), "--sources", "postings", "--posting-sample", "1"])
 
     assert rc == 0
     rows = read_jsonl(out)
@@ -504,3 +496,96 @@ def test_orcid_only_supervisor_gets_no_cris_uuid(tmp_path, monkeypatch):
     for row in rows:
         assert row.gold_supervisors[0].name == "Foreign, Fred"
         assert row.gold_supervisors[0].cris_uuid is None
+
+
+# ---------------------------------------------------------------------------
+# _check_fingerprint unit tests
+# ---------------------------------------------------------------------------
+
+
+def _make_manifest(*, model="BAAI/bge-m3", dim=1024, pubs=214756, postings=695):
+    return BenchmarkManifest(
+        generated_at="2026-08-31T00:00:00+00:00",
+        schema_fingerprint="032028c3e280",
+        corpus={"publications": pubs, "postings": postings},
+        index={"embedding_model": model, "embedding_dim": dim, "document_count": pubs + postings},
+    )
+
+
+def test_fingerprint_ok_when_matching():
+    header = {}
+    cli._check_fingerprint(
+        _make_manifest(),
+        _INDEX_STATUS,
+        "bench.jsonl",
+        strict=True,
+        report_header=header,
+    )
+    assert header["fingerprint_check"] == "ok"
+    assert header["benchmark_fingerprint"] == "032028c3e280"
+    assert header["benchmark_corpus_counts"]["publications"] == 214756
+
+
+def test_fingerprint_warn_no_manifest():
+    header = {}
+    cli._check_fingerprint(
+        None,
+        _INDEX_STATUS,
+        "bench.jsonl",
+        strict=True,
+        report_header=header,
+    )
+    assert header["fingerprint_check"] == "warn:no_manifest"
+    assert header["benchmark_fingerprint"] is None
+
+
+def test_fingerprint_hard_abort_on_model_mismatch():
+    header = {}
+    with pytest.raises(SystemExit, match="BAAI/bge-m3.*wrong-model"):
+        cli._check_fingerprint(
+            _make_manifest(model="wrong-model"),
+            _INDEX_STATUS,
+            "bench.jsonl",
+            strict=True,
+            report_header=header,
+        )
+    assert header["fingerprint_check"] == "abort:model_mismatch"
+
+
+def test_fingerprint_hard_abort_on_dim_mismatch():
+    header = {}
+    with pytest.raises(SystemExit, match="1024.*512"):
+        cli._check_fingerprint(
+            _make_manifest(dim=512),
+            _INDEX_STATUS,
+            "bench.jsonl",
+            strict=True,
+            report_header=header,
+        )
+    assert header["fingerprint_check"] == "abort:dim_mismatch"
+
+
+def test_fingerprint_override_downgrades_abort_to_warning():
+    header = {}
+    # strict=False should NOT raise, just warn
+    cli._check_fingerprint(
+        _make_manifest(model="wrong-model"),
+        _INDEX_STATUS,
+        "bench.jsonl",
+        strict=False,
+        report_header=header,
+    )
+    assert header["fingerprint_check"] == "abort:model_mismatch"
+
+
+def test_fingerprint_soft_warn_on_doc_count_drift():
+    header = {}
+    # Make publications differ by >1% from the index doc count
+    cli._check_fingerprint(
+        _make_manifest(pubs=100000, postings=100),
+        _INDEX_STATUS,
+        "bench.jsonl",
+        strict=True,
+        report_header=header,
+    )
+    assert header["fingerprint_check"] == "warn:doc_count_drift"

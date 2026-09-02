@@ -67,14 +67,14 @@ def main() -> int:
         ra = r_adjacent if r_adjacent is not None else miss
         rt = r_true if r_true is not None else miss
 
-        separation = ra - rt  # positive = embedding correctly separates
+        separation = min(ra, rg) - rt  # positive = embedding correctly separates true from both
 
         # Format rank for display
         def fmt(r: int | None) -> str:
             return str(r) if r is not None else f">{args.top_k}"
 
-        is_failure = rt >= ra or rt >= rg
-        marker = " ✗ FAIL" if is_failure else " ✓"
+        is_failure = separation <= 0
+        marker = " [FAIL]" if is_failure else " [OK]"
         if is_failure:
             failures += 1
         else:
@@ -87,7 +87,7 @@ def main() -> int:
 
     print("-" * 70)
     total = successes + failures
-    print(f"Positive separation: {successes}/{total} ({100*successes/total:.0f}%)")
+    print(f"Positive separation: {successes}/{total} ({100 * successes / total:.0f}%)")
     if failures:
         print(
             f"Failures: {failures}/{total} — the embedding matched the neighbourhood, "

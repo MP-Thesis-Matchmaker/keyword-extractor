@@ -20,3 +20,13 @@ __pycache__/
 TEMP/*
 TEMP
 demo
+
+!data/benchmark_v4.jsonl
+!data/benchmark_v4.manifest.json
+!data/eval_report_v4.jsonl
+!data/specificity_v4.jsonl
+!data/specificity_v4.manifest.json
+!data/specificity_out_v4.jsonl
+!data/benchmark_ablation_v3.jsonl
+!data/benchmark_ablation_v3.manifest.json
+!data/eval_ablation_v3.jsonl

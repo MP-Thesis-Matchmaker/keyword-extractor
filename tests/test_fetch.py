@@ -45,18 +45,18 @@ def test_supervisor_candidates_query_without_language():
 
 def test_publications_query_predicates():
     sql, params = publications_query(
-        supervisor="Doe, Jane", language="eng", require_abstract=True, max_pubs=20
+        supervisor_names=["Doe, Jane"], language="eng", require_abstract=True, max_pubs=20
     )
-    assert "%(supervisor)s = ANY(uzh_authors)" in sql
+    assert "uzh_authors && %(supervisor_names)s" in sql
     assert "abstract IS NOT NULL" in sql
     assert "ORDER BY year DESC NULLS LAST, id" in sql
     assert "LIMIT %(max_pubs)s" in sql
-    assert params["supervisor"] == "Doe, Jane"
+    assert params["supervisor_names"] == ["Doe, Jane"]
 
 
 def test_publications_query_unlimited():
     sql, _ = publications_query(
-        supervisor="Doe, Jane", language=None, require_abstract=False, max_pubs=None
+        supervisor_names=["Doe, Jane"], language=None, require_abstract=False, max_pubs=None
     )
     assert "LIMIT" not in sql
     assert "abstract IS NOT NULL" not in sql

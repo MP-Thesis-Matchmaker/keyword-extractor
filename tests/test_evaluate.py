@@ -185,10 +185,12 @@ def test_recall_equals_hit_for_single_gold():
 def test_difficulty_breakdown():
     """Difficulty tiers from metadata are reported in the summary."""
     rows = [
-        _multi_gold_row("q1", ["Doe, Jane"], source_type="publication",
-                        metadata={"difficulty": "easy"}),
-        _multi_gold_row("q2", ["Roe, Richard"], source_type="publication",
-                        metadata={"difficulty": "hard"}),
+        _multi_gold_row(
+            "q1", ["Doe, Jane"], source_type="publication", metadata={"difficulty": "easy"}
+        ),
+        _multi_gold_row(
+            "q2", ["Roe, Richard"], source_type="publication", metadata={"difficulty": "hard"}
+        ),
     ]
     find = _find_factory({"q1": ["Doe, Jane"], "q2": ["Nobody"]})
     report = evaluate(rows, top_k=5, find=find)

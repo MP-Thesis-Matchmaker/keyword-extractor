@@ -258,7 +258,7 @@ def _supervisor_rows(
     for cand in chosen:
         pubs = fetch_publications(
             conn,
-            cand.name,
+            [cand.name] + getattr(cand, "aliases", []),
             language=args.publication_language,
             max_pubs=args.supervisor_max_pubs or None,
         )
@@ -404,20 +404,17 @@ def _posting_rows(
     return rows
 
 
-
 _SPECIFICITY_RUNGS = ("general", "adjacent", "true")
 
 
-def _parse_adjacent_map(adjacent_args: list[str] | None) -> dict[str, str]:
-    """Parse --adjacent 'Name=subfield' arguments into a lookup dict."""
+def _parse_map(args_list: list[str] | None, flag_name: str) -> dict[str, str]:
+    """Parse '--flag Name=value' arguments into a lookup dict."""
     result: dict[str, str] = {}
-    for entry in adjacent_args or []:
+    for entry in args_list or []:
         if "=" not in entry:
-            raise SystemExit(
-                f"--adjacent requires 'SupervisorName=adjacent subfield' format, got: {entry!r}"
-            )
-        name, subfield = entry.split("=", 1)
-        result[name.strip()] = subfield.strip()
+            raise SystemExit(f"{flag_name} requires 'SupervisorName=value' format, got: {entry!r}")
+        name, value = entry.split("=", 1)
+        result[name.strip()] = value.strip()
     return result
 
 
@@ -437,7 +434,8 @@ def _specificity_rows(
     if not args.supervisor_names:
         raise SystemExit("--specificity requires --supervisor-names")
 
-    adjacent_map = _parse_adjacent_map(getattr(args, "adjacent", None))
+    adjacent_map = _parse_map(getattr(args, "adjacent", None), "--adjacent")
+    general_map = _parse_map(getattr(args, "general", None), "--general")
 
     chosen = [
         SupervisorCandidate(name=name, cris_uuid=None, publication_count=0)
@@ -450,11 +448,11 @@ def _specificity_rows(
         if cand.name not in adjacent_map:
             raise SystemExit(
                 f"--adjacent missing for supervisor {cand.name!r}. "
-                f"Provide: --adjacent \"{cand.name}=<adjacent subfield>\""
+                f'Provide: --adjacent "{cand.name}=<adjacent subfield>"'
             )
         pubs = fetch_publications(
             conn,
-            cand.name,
+            [cand.name] + getattr(cand, "aliases", []),
             language=args.publication_language,
             max_pubs=args.supervisor_max_pubs or None,
         )
@@ -467,6 +465,7 @@ def _specificity_rows(
 
     per_doc = extractor.extract(all_docs)
     rows: list[BenchmarkRow] = []
+    # Maximum 3 rungs per supervisor, but might be 2 if general is omitted
     progress = _Progress("specificity", len(slices) * 3)
 
     for cand, pairs, start in slices:
@@ -483,16 +482,20 @@ def _specificity_rows(
 
         # true = top keyphrase (most specific to this supervisor)
         true_topic = keywords[0]
-        # general = last keyphrase (broadest / least specific)
-        general_topic = keywords[-1]
         # adjacent = human-provided subfield they don't work in
         adjacent_topic = adjacent_map[cand.name]
 
         rung_topics = {
             "true": true_topic,
-            "general": general_topic,
             "adjacent": adjacent_topic,
         }
+
+        # general = human-provided broad topic
+        if cand.name in general_map:
+            rung_topics["general"] = general_map[cand.name]
+        else:
+            # We omit the general rung if no general term is provided
+            progress.advance()
 
         for rung, topic in rung_topics.items():
             context = QueryContext(
@@ -532,8 +535,6 @@ def _specificity_rows(
             progress.advance()
     progress.finish()
     return rows
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -578,11 +579,10 @@ def _generate_background_text(
 ) -> str:
     """Generate a plausible student background sentence.
 
-    Cached by department + seed so the same department always produces the same
-    background within a run. Falls back to a deterministic template if the LLM
-    is unavailable.
+    Cached by top keyword + seed so it is row/topic-specific.
+    Falls back to a deterministic template if the LLM is unavailable.
     """
-    cache_key = f"{department or 'unknown'}:{seed}"
+    cache_key = f"{keywords[0] if keywords else 'unknown'}:{seed}"
     if cache_key in cache:
         return cache[cache_key]
 
@@ -592,9 +592,7 @@ def _generate_background_text(
         from keyword_extractor.synthesis.llm import LLMSynthesizer
 
         if isinstance(synthesizer, LLMSynthesizer):
-            text = synthesizer._chat(
-                f"Thesis topic: {topic_summary}\n{_BACKGROUND_PROMPT}"
-            )
+            text = synthesizer._chat(f"Thesis topic: {topic_summary}\n{_BACKGROUND_PROMPT}")
             if text:
                 cache[cache_key] = text
                 return text
@@ -602,7 +600,9 @@ def _generate_background_text(
         pass
 
     # Deterministic fallback
-    dept_short = (department or "my department").split("of ")[-1].strip() if department else "my field"
+    dept_short = (
+        (department or "my department").split("of ")[-1].strip() if department else "my field"
+    )
     fallback = (
         f"I have completed coursework in {dept_short} and worked on "
         f"a semester project related to {keywords[0] if keywords else 'this topic'}."
@@ -651,7 +651,7 @@ def _ablation_background_rows(
     for cand in chosen:
         pubs = fetch_publications(
             conn,
-            cand.name,
+            [cand.name] + getattr(cand, "aliases", []),
             language=args.publication_language,
             max_pubs=args.supervisor_max_pubs or None,
         )
@@ -742,35 +742,82 @@ def _ablation_background_rows(
     return rows
 
 
-def _warn_on_index_drift(
-    manifest: BenchmarkManifest | None, index: dict, benchmark: str
+def _check_fingerprint(
+    manifest: BenchmarkManifest | None,
+    index: dict,
+    benchmark: str,
+    *,
+    strict: bool = True,
+    report_header: dict,
 ) -> None:
-    """Say so when the benchmark was generated against a different index.
+    """Compare the benchmark's generation-time fingerprint against the live index.
 
-    Deliberately not a check against the live database's schema fingerprint:
-    evaluation no longer opens a connection, and reintroducing one to validate a
-    manifest would undo the point of the HTTP migration. The realistic failure
-    is evaluating an old benchmark against a re-indexed matcher, and that is
-    visible from the manifest alone.
+    Writes ``fingerprint_check``, ``benchmark_fingerprint``, and
+    ``benchmark_corpus_counts`` into *report_header* so every report is
+    self-describing.
+
+    *strict* (default True) controls whether a HARD mismatch aborts the run.
+    Pass ``strict=False`` (``--allow-fingerprint-mismatch``) to downgrade the
+    abort to a warning for intentional cross-index sensitivity runs.
     """
+    report_header["benchmark_fingerprint"] = None
+    report_header["benchmark_corpus_counts"] = None
+
     if manifest is None:
+        report_header["fingerprint_check"] = "warn:no_manifest"
         print(
-            f"NOTE: {benchmark} has no run manifest, so the corpus its gold "
-            "labels came from is unrecorded. Regenerate it to get one.",
+            f"WARNING: {benchmark} has no run manifest — fingerprint check "
+            "skipped. Regenerate the benchmark to get one.",
             file=sys.stderr,
             flush=True,
         )
         return
-    was = (manifest.index or {}).get("embedding_model")
-    now = index.get("embedding_model")
-    if was and now and was != now:
+
+    report_header["benchmark_fingerprint"] = manifest.schema_fingerprint
+    report_header["benchmark_corpus_counts"] = manifest.corpus
+
+    # --- HARD: embedding model mismatch ---
+    intended_model = (manifest.index or {}).get("embedding_model")
+    live_model = index.get("embedding_model")
+    if intended_model and live_model and intended_model != live_model:
+        report_header["fingerprint_check"] = "abort:model_mismatch"
+        msg = (
+            f"Index model '{live_model}' != benchmark's intended "
+            f"'{intended_model}'. Rebuild the index or regenerate the "
+            "benchmark."
+        )
+        if strict:
+            raise SystemExit(msg)
+        print(f"WARNING (overridden): {msg}", file=sys.stderr, flush=True)
+
+    # --- HARD: embedding dimension mismatch ---
+    intended_dim = (manifest.index or {}).get("embedding_dim")
+    live_dim = index.get("embedding_dim")
+    if intended_dim and live_dim and intended_dim != live_dim:
+        report_header["fingerprint_check"] = "abort:dim_mismatch"
+        msg = (
+            f"Index dimension {live_dim} != benchmark's intended "
+            f"{intended_dim}. Rebuild the index or regenerate the "
+            "benchmark."
+        )
+        if strict:
+            raise SystemExit(msg)
+        print(f"WARNING (overridden): {msg}", file=sys.stderr, flush=True)
+
+    # --- SOFT: corpus / document-count drift ---
+    manifest_docs = manifest.corpus.get("publications", 0) + manifest.corpus.get("postings", 0)
+    index_docs = index.get("document_count")
+    if manifest_docs and index_docs and abs(index_docs - manifest_docs) / manifest_docs > 0.01:
+        report_header.setdefault("fingerprint_check", "warn:doc_count_drift")
         print(
-            f"WARNING: this benchmark was generated against an index built with {was}, "
-            f"but the matcher answering is on {now}. The scores are not comparable "
-            "with earlier runs of the same file.",
+            f"WARNING: corpus drift — benchmark was generated against "
+            f"{manifest_docs} documents, but the index has {index_docs}. "
+            "Ground truth may have moved since the benchmark was built.",
             file=sys.stderr,
             flush=True,
         )
+
+    report_header.setdefault("fingerprint_check", "ok")
 
 
 def _index_status_if_reachable(settings: Settings) -> dict | None:
@@ -920,16 +967,26 @@ def _evaluate(args: argparse.Namespace) -> int:
             flush=True,
         )
         manifest = read_manifest(Path(args.benchmark))
-        _warn_on_index_drift(manifest, index, args.benchmark)
-        report = evaluate(
-            rows, top_k=args.top_k, find=client.match, concurrency=concurrency
+        report_header: dict = {}
+        _check_fingerprint(
+            manifest,
+            index,
+            args.benchmark,
+            strict=not args.allow_fingerprint_mismatch,
+            report_header=report_header,
         )
+        report = evaluate(rows, top_k=args.top_k, find=client.match, concurrency=concurrency)
     finally:
         client.close()
 
     print(
         json.dumps(
-            {"index": index, "label": args.label, "summary": report.summary},
+            {
+                "index": index,
+                "label": args.label,
+                **report_header,
+                "summary": report.summary,
+            },
             indent=2,
         )
     )
@@ -986,9 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         "already restricts uzh_authors to registered UZH researchers -- so the "
         "printed candidate/cris-typed pair is really an invariant check",
     )
-    gen.add_argument(
-        "--posting-sample", type=int, default=25, help="postings to sample; 0 = all"
-    )
+    gen.add_argument("--posting-sample", type=int, default=25, help="postings to sample; 0 = all")
     gen.add_argument(
         "--publication-language",
         default=None,
@@ -1025,7 +1080,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="'SupervisorName=adjacent subfield' for the specificity ablation. "
         "Repeatable, one per supervisor. Example: "
-        "\"Sennrich, R=text summarisation\"",
+        '"Sennrich, R=text summarisation"',
+    )
+    gen.add_argument(
+        "--general",
+        action="append",
+        default=None,
+        help="'SupervisorName=general field' for the specificity ablation. "
+        "Repeatable, one per supervisor. Example: "
+        '"Sennrich, R=natural language processing"',
     )
     gen.add_argument(
         "--ablation-background",
@@ -1063,6 +1126,14 @@ def main(argv: list[str] | None = None) -> int:
         help="free-text note recorded in the report, e.g. the matcher's retrieval "
         "regime. GET /v1/index/status reports the index but not whether the server "
         "was configured to require a UZH author, so that has to be recorded here",
+    )
+    ev.add_argument(
+        "--allow-fingerprint-mismatch",
+        action="store_true",
+        default=False,
+        help="downgrade a hard fingerprint mismatch (model/dimension) from an abort "
+        "to a warning. Use for intentional cross-index sensitivity runs (e.g. "
+        "scoring the same benchmark against a differently configured matcher)",
     )
     _add_log_level(ev)
 

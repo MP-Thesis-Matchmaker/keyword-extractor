@@ -67,9 +67,7 @@ def test_index_not_built_names_the_remediation():
 
 def test_index_not_built_is_recognised_by_code_not_wording():
     """The message is for humans and may be reworded upstream at any time."""
-    client = _client(
-        lambda request: _refusal(409, "index_not_built", "totally different phrasing")
-    )
+    client = _client(lambda request: _refusal(409, "index_not_built", "totally different phrasing"))
     with pytest.raises(IndexNotBuiltError):
         client.match("anything")
 

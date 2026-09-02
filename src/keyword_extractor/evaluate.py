@@ -91,17 +91,27 @@ def evaluate(
 
     row_results: list[dict[str, Any]] = []
     for row, results in zip(rows, all_results, strict=True):
-        names = [str(r.get("supervisor") or r.get("name") or "").casefold() for r in results]
-        gold = {g.name.casefold() for g in row.gold_supervisors}
-        rank = next((i + 1 for i, name in enumerate(names) if name in gold), None)
+
+        def _normalize_name(name: str) -> frozenset[str]:
+            # "Sennrich, Rico" -> {"sennrich", "rico"}
+            # "Rico Sennrich" -> {"rico", "sennrich"}
+            return frozenset(part.strip() for part in name.casefold().replace(",", " ").split())
+
+        names_norm = [
+            _normalize_name(str(r.get("supervisor") or r.get("name") or "")) for r in results
+        ]
+        gold_norm = {_normalize_name(g.name) for g in row.gold_supervisors}
+
+        rank = next((i + 1 for i, name_n in enumerate(names_norm) if name_n in gold_norm), None)
+
         # recall@k: fraction of gold supervisors found in top-k.
         # For single-gold rows (publications), recall@k ≡ hit@k.
         # For multi-gold rows (postings with several supervisors), this is where
         # recall carries independent signal.
-        gold_count = len(gold)
+        gold_count = len(gold_norm)
         recall_at = {}
         for k in (1, 5, top_k):
-            found = len({name for name in names[:k] if name in gold})
+            found = len({name_n for name_n in names_norm[:k] if name_n in gold_norm})
             recall_at[k] = found / gold_count if gold_count else 0.0
         row_results.append(
             {
@@ -134,6 +144,9 @@ def evaluate(
         subset = [r for r in row_results if r.get("difficulty") == difficulty]
         if subset:
             summary[f"difficulty:{difficulty}"] = _metrics(subset, top_k)
+        pub_subset = [r for r in subset if r["source_type"] == "publication"]
+        if pub_subset:
+            summary[f"difficulty:{difficulty} (pubs)"] = _metrics(pub_subset, top_k)
     return EvalReport(summary=summary, rows=row_results)
 
 
