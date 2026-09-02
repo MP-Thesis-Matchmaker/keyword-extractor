@@ -43,6 +43,9 @@ def _metrics(row_results: list[dict[str, Any]], top_k: int) -> dict[str, float |
     def hit(k: int) -> float:
         return sum(1 for r in row_results if r["rank"] is not None and r["rank"] <= k) / n
 
+    def recall(k: int) -> float:
+        return sum(r.get("recall_at", {}).get(k, 0.0) for r in row_results) / n
+
     mrr = sum(1.0 / r["rank"] for r in row_results if r["rank"] is not None) / n
     return {
         "n": n,
@@ -50,6 +53,9 @@ def _metrics(row_results: list[dict[str, Any]], top_k: int) -> dict[str, float |
         "hit@5": round(hit(5), 4),
         f"hit@{top_k}": round(hit(top_k), 4),
         "mrr": round(mrr, 4),
+        "recall@1": round(recall(1), 4),
+        "recall@5": round(recall(5), 4),
+        f"recall@{top_k}": round(recall(top_k), 4),
     }
 
 
@@ -88,6 +94,15 @@ def evaluate(
         names = [str(r.get("supervisor") or r.get("name") or "").casefold() for r in results]
         gold = {g.name.casefold() for g in row.gold_supervisors}
         rank = next((i + 1 for i, name in enumerate(names) if name in gold), None)
+        # recall@k: fraction of gold supervisors found in top-k.
+        # For single-gold rows (publications), recall@k ≡ hit@k.
+        # For multi-gold rows (postings with several supervisors), this is where
+        # recall carries independent signal.
+        gold_count = len(gold)
+        recall_at = {}
+        for k in (1, 5, top_k):
+            found = len({name for name in names[:k] if name in gold})
+            recall_at[k] = found / gold_count if gold_count else 0.0
         row_results.append(
             {
                 "query": row.query,
@@ -97,6 +112,9 @@ def evaluate(
                 "source_ids": row.source_ids,
                 "gold": [g.name for g in row.gold_supervisors],
                 "rank": rank,
+                "recall_at": recall_at,
+                "difficulty": row.metadata.get("difficulty"),
+                "rung": row.metadata.get("rung"),
             }
         )
     summary = {"overall": _metrics(row_results, top_k)}
@@ -110,6 +128,12 @@ def evaluate(
         subset = [r for r in row_results if r["complexity"] == complexity]
         if subset:
             summary[f"complexity:{complexity}"] = _metrics(subset, top_k)
+    # Difficulty tiers (Part 1b): easy/hard based on gold supervisor's indexed
+    # publication count. Only present on rows generated with --difficulty-threshold.
+    for difficulty in ("easy", "hard"):
+        subset = [r for r in row_results if r.get("difficulty") == difficulty]
+        if subset:
+            summary[f"difficulty:{difficulty}"] = _metrics(subset, top_k)
     return EvalReport(summary=summary, rows=row_results)
 
 

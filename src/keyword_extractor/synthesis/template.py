@@ -132,4 +132,9 @@ class TemplateSynthesizer:
             keywords=_join(select_keywords(keywords, context.complexity), language),
             department=context.department or "",
         )
+        # Append student-context fields for background ablation (Part 3).
+        if context.study_program:
+            text += f" I am studying {context.study_program}."
+        if context.student_background:
+            text += f" {context.student_background}"
         return SynthesizedQuery(text=text, style="template")
