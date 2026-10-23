@@ -146,6 +146,10 @@ uv run --extra extraction keyword-extractor generate \
     --supervisor-sample 25 --posting-sample 0 \
     --seed 42 \
     --out data/benchmark_ablation_v3.jsonl
+
+# Analyze the results after evaluating, then test each arm against topic_only:
+uv run python scripts/analyze_ablation.py data/eval_ablation_v4.jsonl
+uv run python scripts/analyze_ablation_significance.py data/eval_ablation_v4.jsonl
 ```
 
 **Progress.** Long runs print a row counter with an ETA to stderr every 25 rows, so an LLM
