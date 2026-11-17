@@ -24,12 +24,14 @@ Postgres (backend-core's DB)
                                                     ▼
                             data/benchmark.jsonl  (query + gold supervisors)
                                                     ▼
-                            evaluate: POST /v1/match (themis-matcher) → hit@k, MRR
+                            evaluate: POST /v1/match (themis-matcher) → hit@k, recall@k, MRR
 ```
 
 Each benchmark row records the query, the extracted keywords, the source publication/posting
 ids, the gold supervisor(s) (name + CRIS UUID where known), and generation metadata — enough
-to audit any row back to its source and to compare runs across parameter changes.
+to audit any row back to its source and to compare runs across parameter changes. Supervisor
+candidates are grouped by CRIS UUID before sampling so split name variants in DSpace (e.g.
+`"Sennrich, R"` and `"Sennrich, Rico"`) have their publication counts and aliases unified.
 
 **Complexity levels.** Every supervisor and posting yields **three rows** — `low`, `medium`,
 `high` — from a single keyword extraction, so a run's row count is three times its source
@@ -84,10 +86,10 @@ uv run themis-matcher serve          # 127.0.0.1:8100 by default
 # Default scope: 25 sampled supervisors x <=20 recent pubs, plus 25 sampled postings.
 uv run --extra extraction keyword-extractor generate --out data/benchmark.jsonl
 
-# Generate the 300-row difficulty baseline (150 supervisors, publications only):
+# Generate the 900-row v4 baseline (150 supervisors + 150 postings, 3 complexities each):
 uv run --extra extraction keyword-extractor generate \
-    --supervisor-sample 150 --posting-sample 0 \
-    --difficulty-threshold 10 \
+    --supervisor-sample 150 --posting-sample 150 \
+    --difficulty-threshold 10 --seed 42 \
     --out data/benchmark_v4.jsonl
 
 # Hand-picked supervisors (best label quality; sidesteps the ORCID bug, see caveats):
@@ -114,49 +116,14 @@ axes. The old spellings now exit with the name of their replacement.
 | `--difficulty-threshold N` | tags supervisors with `< N` publications as `hard`, else `easy` |
 
 `--seed` drives both samples. Also useful: `--sources publications,postings`,
-`--query-style auto|template|llm`, `--log-level`.
-
-## Evaluation Ablations
-
-Beyond standard queries, the generator supports two targeted ablation modes for the thesis.
-
-### 1. Specificity Ablation
-Tests if the embedding "smooths over" specific jargon by comparing a supervisor's *true* specialization against a *general* topic and a related but *adjacent* topic.
-
-```bash
-uv run --extra extraction keyword-extractor generate \
-    --specificity --seed 42 \
-    --supervisor-names "Sennrich, Rico" "Aepli, Noëmi" \
-    --adjacent "Sennrich, Rico=text summarisation" \
-    --adjacent "Aepli, Noëmi=dialectology" \
-    --general "Sennrich, Rico=natural language processing" \
-    --general "Aepli, Noëmi=natural language processing" \
-    --out data/specificity_v4.jsonl
-
-# Analyze the results after evaluating:
-uv run python scripts/analyze_specificity.py data/specificity_out_v4.jsonl
-```
-
-### 2. Student Background Ablation
-Tests if adding conversational student context (e.g., study programs, past experience) dilutes the core research topic. Generates 4 query variants per supervisor: `topic_only`, `plus_program`, `plus_background`, and `full`.
-
-```bash
-uv run --extra extraction keyword-extractor generate \
-    --ablation-background \
-    --supervisor-sample 25 --posting-sample 0 \
-    --seed 42 \
-    --out data/benchmark_ablation_v3.jsonl
-
-# Analyze the results after evaluating, then test each arm against topic_only:
-uv run python scripts/analyze_ablation.py data/eval_ablation_v4.jsonl
-uv run python scripts/analyze_ablation_significance.py data/eval_ablation_v4.jsonl
-```
+`--query-style auto|template|llm`, `--require-cris-uuid` / `--no-require-cris-uuid`,
+`--log-level`.
 
 **Progress.** Long runs print a row counter with an ETA to stderr every 25 rows, so an LLM
 run over thousands of sequential calls reads as working rather than hung:
 
 ```
-supervisor candidates: 6573, sampled: 25
+supervisor candidates: 1871, cris-typed: 1871, sampled: 25
 publications 75/75 rows
 postings     25/1737 rows  eta 2h18m
 ```
@@ -180,26 +147,81 @@ Two different failures are survived, and they are not the same problem:
 Run at `--log-level info` (the default) to see both as they happen; `httpx`'s own per-request
 lines stay suppressed so the progress counter survives.
 
+## Evaluation Ablations
+
+Beyond standard queries, the generator supports two targeted ablation modes for the thesis.
+
+### 1. Specificity Ablation
+Tests if the embedding "smooths over" specific jargon by comparing a supervisor's *true* specialization (KeyBERT's top-ranked keyphrase) against a human-provided broad *general* topic and a related but *adjacent* subfield they do not work in. `data/specificity_v4.jsonl` evaluates 8 supervisors across all 3 rungs (24 rows):
+
+```bash
+uv run --extra extraction keyword-extractor generate \
+    --specificity --difficulty-threshold 10 --seed 42 \
+    --supervisor-names "Sennrich, Rico" "Aepli, Noëmi" \
+    --adjacent "Sennrich, Rico=text summarisation" \
+    --adjacent "Aepli, Noëmi=dialectology" \
+    --general "Sennrich, Rico=natural language processing" \
+    --general "Aepli, Noëmi=natural language processing" \
+    --out data/specificity_v4.jsonl
+
+# Evaluate and check whether 'true' ranks strictly better than 'general' and 'adjacent':
+uv run keyword-extractor evaluate \
+    --benchmark data/specificity_v4.jsonl --top-k 10 --out data/specificity_out_v4.jsonl
+uv run python scripts/analyze_specificity.py data/specificity_out_v4.jsonl
+```
+
+### 2. Student Background Ablation
+Tests if adding conversational student context (study program derived from department/faculty, plus an LLM- or template-generated background sentence cached per topic and seed) dilutes the core research topic. Generates 4 medium-complexity query variants per supervisor: `topic_only`, `plus_program`, `plus_background`, and `full` (`data/benchmark_ablation_v4.jsonl` covers 100 supervisors = 400 rows):
+
+```bash
+uv run --extra extraction keyword-extractor generate \
+    --ablation-background \
+    --supervisor-sample 100 --difficulty-threshold 10 \
+    --seed 42 \
+    --out data/benchmark_ablation_v4.jsonl
+
+uv run keyword-extractor evaluate \
+    --benchmark data/benchmark_ablation_v4.jsonl --top-k 10 --out data/eval_ablation_v4.jsonl
+
+# Per-arm metrics and deltas vs topic_only:
+uv run python scripts/analyze_ablation.py data/eval_ablation_v4.jsonl
+
+# Paired significance tests (exact McNemar on Hit@1/Hit@5, sign-flip + bootstrap 95% CI on MRR):
+uv run python scripts/analyze_ablation_significance.py data/eval_ablation_v4.jsonl
+```
+
 ## Evaluate (trial retrieval rounds)
 
 ```bash
 uv run keyword-extractor evaluate \
-    --benchmark data/benchmark.jsonl --top-k 10 --out data/eval_report.jsonl
+    --benchmark data/benchmark_v4.jsonl --top-k 10 --out data/eval_report_v4.jsonl
+
+# Print summary tables by source type, complexity level, and difficulty tier:
+uv run python scripts/analyze_eval.py data/eval_report_v4.jsonl
 ```
 
-Prints hit@k, recall@k, and MRR, overall and split by publications vs postings, by complexity level, and by publication-count difficulty tier;
+Prints hit@k, recall@k, and MRR, overall and split by publications vs postings, by complexity level, and by publication-count difficulty tier (`easy` ≥ 10 pubs vs `hard` < 10 pubs);
 `--out` keeps per-row ranks so weak queries can be found and the KeyBERT/template
-parameters adjusted (the supervisor's "play around ... based on trial rounds" step).
+parameters adjusted (the supervisor's "play around ... based on trial rounds" step). Gold
+matching normalises supervisor names into casefolded token sets so `"Sennrich, Rico"` and
+`"Rico Sennrich"` match.
 
 No extras: evaluation runs off the base install. It used to import backend-core in-process
 through a uv path dependency, which meant a sibling checkout, a psycopg pool and a 2.27 GB
 embedding model loaded here just to score a benchmark. Retrieval is an HTTP call to the
 matcher now, which owns all three.
 
-Before the first query it preflights `GET /v1/index/status` and prints which index is about
-to answer — model, dimension, document count — and records it in the report. A matcher with
-no index fails the run in a second rather than after one timeout per row, with a message
-naming the command that builds one. `--matcher-base-url` points a single run at a
+Before the first query it preflights `GET /v1/index/status`, prints which index is about
+to answer — model, dimension, document count — and checks it against the benchmark's
+`*.manifest.json` sidecar (`fingerprint_check` in the report):
+- **Hard mismatch (abort):** the live index's `embedding_model` or `embedding_dim` differs
+  from the manifest. Pass `--allow-fingerprint-mismatch` to downgrade the abort to a warning
+  for intentional cross-index sensitivity runs.
+- **Soft drift (warn):** the live index's `document_count` differs from the manifest's corpus
+  count by more than 1%, or the benchmark has no manifest sidecar.
+
+A matcher with no index fails the run in a second rather than after one timeout per row, with
+a message naming the command that builds one. `--matcher-base-url` points a single run at a
 differently configured matcher; `--label` records what that configuration was, since the
 status endpoint reports the index but not the server's retrieval settings.
 
@@ -228,15 +250,19 @@ uv run ruff check
   publications with a UZH author fell 91,729 → 53,545, and distinct names 58,218 → 2,942.
   **It also invalidated the first benchmark**: 87 of `benchmark_v2.jsonl`'s 105 gold
   supervisors are no longer supervisor-eligible at all, so they cannot be retrieved and every
-  score computed from that file understates the system. `benchmark_v2.jsonl` is kept as the
-  pre-fix artefact. Note that `benchmark_v3.jsonl` suffered from a split-identity bug where highly published researchers were fragmented into multiple records with small publication counts; `benchmark_v4.jsonl` is the current, fully unified set.
+  score computed from that file understates the system. `benchmark_v2.jsonl` is kept under
+  `data/sample/` as the pre-fix artefact. `benchmark_v3.jsonl` (also in `data/sample/`)
+  suffered from a split-identity bug where 24 researchers had fragmented CRIS name records
+  (e.g. `"Sennrich, R"` with 14 publications and `"Sennrich, Rico"` with 102); candidates are
+  now unified by `cris_uuid` with merged publication counts and aliases, and
+  `data/benchmark_v4.jsonl` is the current, unified set.
 
   Nothing in v2 revealed this, because a row recorded the extractor and nothing about the
   corpus. Every generate run now writes a `*.manifest.json` sidecar carrying the database's
-  schema fingerprint, the corpus counts, and the run's parameters, so a diff of two manifests
-  answers "did the ground truth move?". `--require-cris-uuid` (on by default) drops nothing
-  today; the candidate/cris-typed pair printed by `generate` is the invariant that would show
-  it moving again.
+  schema fingerprint, the corpus counts, the live index metadata, and the run's parameters,
+  which `evaluate` verifies before scoring. `--require-cris-uuid` (on by default) drops
+  nothing today; the candidate/cris-typed pair printed by `generate` is the invariant that
+  would show it moving again.
 - **Deliberately independent keyword model.** KeyBERT runs
   `paraphrase-multilingual-MiniLM-L12-v2`, not the retrieval model (`BAAI/bge-m3`) —
   extracting keywords in the system-under-test's own embedding space would measure the
@@ -262,8 +288,9 @@ uv run ruff check
 - **Not a generalization test.** Queries are derived from the same corpus retrieval
   searches; this benchmarks retrieval quality, not out-of-distribution behaviour.
 - **Personal data.** The DB and the generated files contain researchers' names. Supervisor
-  emails are stripped at fetch time and never written; `data/` is gitignored and the
-  benchmark bundle stays within the project team.
+  emails are stripped at fetch time and never written; ad-hoc outputs under `data/` are
+  gitignored (while the reference `v4` benchmark/ablation datasets and `data/sample/` are
+  tracked in the repository).
 - macOS: the mps-aborts-without-a-traceback problem belongs to whoever runs
   `themis-matcher serve` (set `MATCHER_EMBEDDING_DEVICE=cpu` there). This process never loads
   an embedding model for retrieval.
