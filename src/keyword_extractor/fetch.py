@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 import psycopg
@@ -122,6 +122,7 @@ class SupervisorCandidate:
     cris_uuid: str | None
     publication_count: int
     authority_type: str | None = None
+    aliases: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -174,13 +175,17 @@ def supervisor_candidates_query(
 
 
 def publications_query(
-    *, supervisor: str, language: str | None, require_abstract: bool, max_pubs: int | None
+    *,
+    supervisor_names: list[str],
+    language: str | None,
+    require_abstract: bool,
+    max_pubs: int | None,
 ) -> tuple[str, dict[str, Any]]:
-    """Publications for one supervisor name, most recent first.
+    """Publications for one or more supervisor name variants, most recent first.
 
-    `= ANY(uzh_authors)` hits the GIN index backend-core created for exactly
+    `uzh_authors && %(supervisor_names)s` hits the GIN index backend-core created for exactly
     this lookup; `ORDER BY year DESC NULLS LAST, id` caps to the most recent
-    work with a deterministic tiebreak (backend-core's sources.py precedent).
+    work with a deterministic tiebreak.
     """
     abstract_clause = "AND abstract IS NOT NULL AND abstract <> ''" if require_abstract else ""
     language_clause = "AND language = %(language)s" if language else ""
@@ -189,13 +194,18 @@ def publications_query(
         SELECT id, title, abstract, uzh_authors, author_authority_map,
                year, department, language, keywords
         FROM publication
-        WHERE %(supervisor)s = ANY(uzh_authors)
+        WHERE uzh_authors && %(supervisor_names)s
           {abstract_clause}
           {language_clause}
         ORDER BY year DESC NULLS LAST, id
         {limit_clause}
     """
-    return sql, {"supervisor": supervisor, "language": language, "max_pubs": max_pubs}
+    params: dict[str, Any] = {
+        "supervisor_names": supervisor_names,
+        "language": language,
+        "max_pubs": max_pubs,
+    }
+    return sql, params
 
 
 def postings_query(*, language: str | None) -> tuple[str, dict[str, Any]]:
@@ -228,26 +238,58 @@ def list_supervisor_candidates(
     monitor of the eligibility rule -- see `SupervisorPool` for why a drop of
     zero is worth printing.
     """
-    sql, params = supervisor_candidates_query(
-        min_publications=min_publications, language=language
-    )
+    sql, params = supervisor_candidates_query(min_publications=min_publications, language=language)
     with conn.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
-    candidates = [
-        SupervisorCandidate(
-            name=name,
-            # Never the raw id: an orcid-typed entry has one too.
-            cris_uuid=auth_id if auth_type == CRIS else None,
-            publication_count=count,
-            authority_type=auth_type,
+
+    # Group by CRIS UUID to handle split identities (e.g. "Sennrich, R" vs "Sennrich, Rico")
+    # Only group candidates that have a cris_uuid, otherwise keep them separate
+    by_uuid: dict[str, list[tuple[str, int]]] = {}
+    standalone: list[SupervisorCandidate] = []
+
+    total_rows = len(rows)
+    for name, auth_id, auth_type, count in rows:
+        is_cris = auth_type == CRIS
+        cris_uuid = auth_id if is_cris else None
+
+        if cris_uuid:
+            by_uuid.setdefault(cris_uuid, []).append((name, count))
+        else:
+            standalone.append(
+                SupervisorCandidate(
+                    name=name,
+                    cris_uuid=None,
+                    publication_count=count,
+                    authority_type=auth_type,
+                )
+            )
+
+    candidates = standalone
+    for cris_uuid, name_counts in by_uuid.items():
+        # The canonical name is the longest string (e.g. "Sennrich, Rico" over "Sennrich, R")
+        name_counts.sort(key=lambda x: len(x[0]), reverse=True)
+        canonical_name = name_counts[0][0]
+        total_pubs = sum(c for _, c in name_counts)
+        aliases = [n for n, _ in name_counts if n != canonical_name]
+
+        candidates.append(
+            SupervisorCandidate(
+                name=canonical_name,
+                cris_uuid=cris_uuid,
+                publication_count=total_pubs,
+                authority_type=CRIS,
+                aliases=aliases,
+            )
         )
-        for name, auth_id, auth_type, count in rows
-    ]
+
+    # Sort candidates by publication count desc
+    candidates.sort(key=lambda c: c.publication_count, reverse=True)
+
     cris_typed = sum(1 for c in candidates if c.cris_uuid)
     if require_cris_uuid:
         candidates = [c for c in candidates if c.cris_uuid]
-    return SupervisorPool(candidates=candidates, total=len(rows), cris_typed=cris_typed)
+    return SupervisorPool(candidates=candidates, total=total_rows, cris_typed=cris_typed)
 
 
 def _reproducible_sample(
@@ -284,15 +326,16 @@ def sample_postings(postings: list[PostingRow], n: int, seed: int = 42) -> list[
 
 def fetch_publications(
     conn: psycopg.Connection,
-    supervisor: str,
+    supervisor: str | list[str],
     *,
     language: str | None = "eng",
     require_abstract: bool = True,
     max_pubs: int | None = 20,
 ) -> list[PublicationRow]:
-    """Publications naming `supervisor` in uzh_authors, most recent first."""
+    """Publications naming `supervisor` (or any of the names) in uzh_authors, most recent first."""
+    supervisor_names = [supervisor] if isinstance(supervisor, str) else supervisor
     sql, params = publications_query(
-        supervisor=supervisor,
+        supervisor_names=supervisor_names,
         language=language,
         require_abstract=require_abstract,
         max_pubs=max_pubs,

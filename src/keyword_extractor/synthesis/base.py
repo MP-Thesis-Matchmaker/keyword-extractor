@@ -37,6 +37,10 @@ class QueryContext:
     # Chooses the phrasing; anything but "deu" is phrased in English.
     language: str | None = None
     complexity: Complexity = "medium"
+    # Optional student-context fields for background ablation (Part 3).
+    # When present, the synthesizer folds them into the query text.
+    study_program: str | None = None
+    student_background: str | None = None
 
 
 @dataclass(frozen=True)

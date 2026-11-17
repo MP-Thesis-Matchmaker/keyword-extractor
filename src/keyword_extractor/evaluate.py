@@ -43,6 +43,9 @@ def _metrics(row_results: list[dict[str, Any]], top_k: int) -> dict[str, float |
     def hit(k: int) -> float:
         return sum(1 for r in row_results if r["rank"] is not None and r["rank"] <= k) / n
 
+    def recall(k: int) -> float:
+        return sum(r.get("recall_at", {}).get(k, 0.0) for r in row_results) / n
+
     mrr = sum(1.0 / r["rank"] for r in row_results if r["rank"] is not None) / n
     return {
         "n": n,
@@ -50,6 +53,9 @@ def _metrics(row_results: list[dict[str, Any]], top_k: int) -> dict[str, float |
         "hit@5": round(hit(5), 4),
         f"hit@{top_k}": round(hit(top_k), 4),
         "mrr": round(mrr, 4),
+        "recall@1": round(recall(1), 4),
+        "recall@5": round(recall(5), 4),
+        f"recall@{top_k}": round(recall(top_k), 4),
     }
 
 
@@ -85,9 +91,28 @@ def evaluate(
 
     row_results: list[dict[str, Any]] = []
     for row, results in zip(rows, all_results, strict=True):
-        names = [str(r.get("supervisor") or r.get("name") or "").casefold() for r in results]
-        gold = {g.name.casefold() for g in row.gold_supervisors}
-        rank = next((i + 1 for i, name in enumerate(names) if name in gold), None)
+
+        def _normalize_name(name: str) -> frozenset[str]:
+            # "Sennrich, Rico" -> {"sennrich", "rico"}
+            # "Rico Sennrich" -> {"rico", "sennrich"}
+            return frozenset(part.strip() for part in name.casefold().replace(",", " ").split())
+
+        names_norm = [
+            _normalize_name(str(r.get("supervisor") or r.get("name") or "")) for r in results
+        ]
+        gold_norm = {_normalize_name(g.name) for g in row.gold_supervisors}
+
+        rank = next((i + 1 for i, name_n in enumerate(names_norm) if name_n in gold_norm), None)
+
+        # recall@k: fraction of gold supervisors found in top-k.
+        # For single-gold rows (publications), recall@k ≡ hit@k.
+        # For multi-gold rows (postings with several supervisors), this is where
+        # recall carries independent signal.
+        gold_count = len(gold_norm)
+        recall_at = {}
+        for k in (1, 5, top_k):
+            found = len({name_n for name_n in names_norm[:k] if name_n in gold_norm})
+            recall_at[k] = found / gold_count if gold_count else 0.0
         row_results.append(
             {
                 "query": row.query,
@@ -97,6 +122,9 @@ def evaluate(
                 "source_ids": row.source_ids,
                 "gold": [g.name for g in row.gold_supervisors],
                 "rank": rank,
+                "recall_at": recall_at,
+                "difficulty": row.metadata.get("difficulty"),
+                "rung": row.metadata.get("rung"),
             }
         )
     summary = {"overall": _metrics(row_results, top_k)}
@@ -110,6 +138,15 @@ def evaluate(
         subset = [r for r in row_results if r["complexity"] == complexity]
         if subset:
             summary[f"complexity:{complexity}"] = _metrics(subset, top_k)
+    # Difficulty tiers (Part 1b): easy/hard based on gold supervisor's indexed
+    # publication count. Only present on rows generated with --difficulty-threshold.
+    for difficulty in ("easy", "hard"):
+        subset = [r for r in row_results if r.get("difficulty") == difficulty]
+        if subset:
+            summary[f"difficulty:{difficulty}"] = _metrics(subset, top_k)
+        pub_subset = [r for r in subset if r["source_type"] == "publication"]
+        if pub_subset:
+            summary[f"difficulty:{difficulty} (pubs)"] = _metrics(pub_subset, top_k)
     return EvalReport(summary=summary, rows=row_results)
 
 

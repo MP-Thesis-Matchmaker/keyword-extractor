@@ -1,0 +1,40 @@
+{
+  "generated_at": "2026-09-09T10:36:36.105755+00:00",
+  "schema_fingerprint": "032028c3e280",
+  "corpus": {
+    "publications": 214756,
+    "publications_with_uzh_authors": 53545,
+    "distinct_uzh_author_names": 2942,
+    "postings": 695
+  },
+  "index": null,
+  "run": {
+    "argv": [
+      "generate",
+      "--ablation-background",
+      "--supervisor-sample",
+      "100",
+      "--difficulty-threshold",
+      "10",
+      "--seed",
+      "42",
+      "--out",
+      "data/benchmark_ablation_v4.jsonl"
+    ],
+    "rows": 400,
+    "seed": 42,
+    "keybert_model": "paraphrase-multilingual-MiniLM-L12-v2",
+    "keybert_top_n": 8,
+    "supervisor_sample": 100,
+    "supervisor_min_pubs": 3,
+    "supervisor_max_pubs": 20,
+    "posting_sample": 25,
+    "publication_language": null,
+    "require_cris_uuid": true,
+    "query_style": "auto",
+    "sources": [
+      "postings",
+      "publications"
+    ]
+  }
+}

@@ -53,10 +53,11 @@ class BenchmarkRow(BaseModel):
     granularity: Literal["supervisor", "posting"]
     # What actually produced the text, not what the run asked for: an LLM
     # synthesiser that fell back to the template records "template".
-    query_style: Literal["template", "llm"]
+    # Ablation modes use "ablation:<arm>" or "specificity".
+    query_style: str
     # Defaulted so benchmark files written before complexity levels existed
     # still load.
-    complexity: Literal["low", "medium", "high"] = "medium"
+    complexity: Literal["low", "medium", "high", "n/a"] = "medium"
     metadata: dict[str, Any] = {}
 
 

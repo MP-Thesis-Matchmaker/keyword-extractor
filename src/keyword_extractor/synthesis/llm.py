@@ -181,6 +181,11 @@ class LLMSynthesizer:
         user = "Keywords: " + "; ".join(selected)
         if context.department:
             user += f"\nSubject area: {context.department}"
+        # Student-context fields for background ablation (Part 3).
+        if context.study_program:
+            user += f"\nStudent's program: {context.study_program}"
+        if context.student_background:
+            user += f"\nStudent background: {context.student_background}"
         # The keywords are in the language of the source publications, so the
         # carrier sentence has to match or the query reads as code-switching.
         if context.language == "deu":

@@ -258,7 +258,7 @@ def _supervisor_rows(
     for cand in chosen:
         pubs = fetch_publications(
             conn,
-            cand.name,
+            [cand.name] + getattr(cand, "aliases", []),
             language=args.publication_language,
             max_pubs=args.supervisor_max_pubs or None,
         )
@@ -296,6 +296,12 @@ def _supervisor_rows(
                 complexity=complexity,
             )
             result = synthesizer.synthesize(keywords, context)
+            # Gold publication count: how many indexed publications the
+            # supervisor has. cand.publication_count is from the DB query
+            # (accurate); len(pubs) is the fallback for --supervisor-names
+            # (capped at --supervisor-max-pubs, but still usable).
+            gold_pub_count = cand.publication_count or len(pubs)
+            difficulty = "easy" if gold_pub_count >= args.difficulty_threshold else "hard"
             rows.append(
                 BenchmarkRow(
                     query=result.text,
@@ -321,6 +327,9 @@ def _supervisor_rows(
                         "keybert_model": settings.keybert_model,
                         "all_keywords": keywords,
                         "seed": args.seed,
+                        "gold_pub_count": gold_pub_count,
+                        "difficulty": difficulty,
+                        "difficulty_threshold": args.difficulty_threshold,
                     },
                 )
             )
@@ -384,6 +393,9 @@ def _posting_rows(
                         "keybert_model": settings.keybert_model,
                         "all_keywords": keywords,
                         "seed": args.seed,
+                        "gold_pub_count": None,
+                        "difficulty": "easy",
+                        "difficulty_threshold": args.difficulty_threshold,
                     },
                 )
             )
@@ -392,35 +404,420 @@ def _posting_rows(
     return rows
 
 
-def _warn_on_index_drift(
-    manifest: BenchmarkManifest | None, index: dict, benchmark: str
-) -> None:
-    """Say so when the benchmark was generated against a different index.
+_SPECIFICITY_RUNGS = ("general", "adjacent", "true")
 
-    Deliberately not a check against the live database's schema fingerprint:
-    evaluation no longer opens a connection, and reintroducing one to validate a
-    manifest would undo the point of the HTTP migration. The realistic failure
-    is evaluating an old benchmark against a re-indexed matcher, and that is
-    visible from the manifest alone.
+
+def _parse_map(args_list: list[str] | None, flag_name: str) -> dict[str, str]:
+    """Parse '--flag Name=value' arguments into a lookup dict."""
+    result: dict[str, str] = {}
+    for entry in args_list or []:
+        if "=" not in entry:
+            raise SystemExit(f"{flag_name} requires 'SupervisorName=value' format, got: {entry!r}")
+        name, value = entry.split("=", 1)
+        result[name.strip()] = value.strip()
+    return result
+
+
+def _specificity_rows(
+    conn,
+    extractor: KeywordExtractor,
+    synthesizer: QuerySynthesizer,
+    settings: Settings,
+    args: argparse.Namespace,
+) -> list[BenchmarkRow]:
+    """Build specificity-ablation rows: 3 rungs (general/adjacent/true) per supervisor.
+
+    Requires --supervisor-names and --adjacent. The 'true' and 'general' rungs
+    are derived from KeyBERT (top-ranked = most specific = true, lowest-ranked
+    = broadest = general). The 'adjacent' rung is human-provided.
     """
-    if manifest is None:
+    if not args.supervisor_names:
+        raise SystemExit("--specificity requires --supervisor-names")
+
+    adjacent_map = _parse_map(getattr(args, "adjacent", None), "--adjacent")
+    general_map = _parse_map(getattr(args, "general", None), "--general")
+
+    chosen = [
+        SupervisorCandidate(name=name, cris_uuid=None, publication_count=0)
+        for name in args.supervisor_names
+    ]
+
+    all_docs: list[str] = []
+    slices: list[tuple[SupervisorCandidate, list[tuple[PublicationRow, str]], int]] = []
+    for cand in chosen:
+        if cand.name not in adjacent_map:
+            raise SystemExit(
+                f"--adjacent missing for supervisor {cand.name!r}. "
+                f'Provide: --adjacent "{cand.name}=<adjacent subfield>"'
+            )
+        pubs = fetch_publications(
+            conn,
+            [cand.name] + getattr(cand, "aliases", []),
+            language=args.publication_language,
+            max_pubs=args.supervisor_max_pubs or None,
+        )
+        pairs = [(p, doc) for p in pubs if (doc := _compose_doc(p.title, p.abstract))]
+        if not pairs:
+            print(f"skipping {cand.name!r}: no usable publications", file=sys.stderr)
+            continue
+        slices.append((cand, pairs, len(all_docs)))
+        all_docs.extend(doc for _, doc in pairs)
+
+    per_doc = extractor.extract(all_docs)
+    rows: list[BenchmarkRow] = []
+    # Maximum 3 rungs per supervisor, but might be 2 if general is omitted
+    progress = _Progress("specificity", len(slices) * 3)
+
+    for cand, pairs, start in slices:
+        keywords = aggregate_keywords(
+            per_doc[start : start + len(pairs)], top_n=settings.keybert_top_n
+        )
+        if not keywords:
+            continue
+
+        pubs = [p for p, _ in pairs]
+        cris_uuid = _resolve_cris_uuid(cand, pubs)
+        department = _most_common([p.department for p in pubs])
+        text_language = _most_common([detect_language(doc) for _, doc in pairs])
+
+        # true = top keyphrase (most specific to this supervisor)
+        true_topic = keywords[0]
+        # adjacent = human-provided subfield they don't work in
+        adjacent_topic = adjacent_map[cand.name]
+
+        rung_topics = {
+            "true": true_topic,
+            "adjacent": adjacent_topic,
+        }
+
+        # general = human-provided broad topic
+        if cand.name in general_map:
+            rung_topics["general"] = general_map[cand.name]
+        else:
+            # We omit the general rung if no general term is provided
+            progress.advance()
+
+        for rung, topic in rung_topics.items():
+            context = QueryContext(
+                seed=cris_uuid or cand.name,
+                department=department,
+                language=text_language,
+                complexity="medium",
+            )
+            result = synthesizer.synthesize([topic], context)
+            rows.append(
+                BenchmarkRow(
+                    query=result.text,
+                    keywords=[topic],
+                    source_type="publication",
+                    source_ids=[p.id for p in pubs],
+                    gold_supervisors=[
+                        GoldSupervisor(
+                            name=cand.name,
+                            cris_uuid=cris_uuid,
+                            authority_type=cand.authority_type or (CRIS if cris_uuid else None),
+                        )
+                    ],
+                    granularity="supervisor",
+                    query_style=result.style,
+                    complexity="n/a",
+                    metadata={
+                        "department": department,
+                        "text_language": text_language,
+                        "keybert_model": settings.keybert_model,
+                        "all_keywords": keywords,
+                        "seed": args.seed,
+                        "rung": rung,
+                        "rung_topic": topic,
+                    },
+                )
+            )
+            progress.advance()
+    progress.finish()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Student-background ablation
+# ---------------------------------------------------------------------------
+
+_BACKGROUND_PROMPT = (
+    "Given this thesis topic, invent a plausible one-sentence student background "
+    "(major, modules taken, a past project). Do not mention any person or supervisor "
+    "names. Return only the sentence."
+)
+
+_ABLATION_ARMS = ("topic_only", "plus_program", "plus_background", "full")
+
+# Simple department → faculty mapping for study_program field.
+_DEPT_TO_FACULTY: dict[str, str] = {
+    "Department of Informatics": "Faculty of Business, Economics and Informatics",
+    "Department of Finance": "Faculty of Business, Economics and Informatics",
+    "Department of Economics": "Faculty of Business, Economics and Informatics",
+    "Department of Business Administration": "Faculty of Business, Economics and Informatics",
+    "Department of Political Science": "Faculty of Arts and Social Sciences",
+    "Department of Chemistry": "Faculty of Science",
+    "Physics Institute": "Faculty of Science",
+    "Institute of Geography": "Faculty of Science",
+    "Institute of Computational Linguistics": "Faculty of Arts and Social Sciences",
+    "Institute of Psychology": "Faculty of Arts and Social Sciences",
+    "Institute of Evolutionary Biology and Environmental Studies": "Faculty of Science",
+    "Institute of Biomedical Engineering": "Faculty of Medicine and Science",
+    "Institute of History": "Faculty of Arts and Social Sciences",
+    "Institute of Philosophy": "Faculty of Arts and Social Sciences",
+    "Institute of Sociology": "Faculty of Arts and Social Sciences",
+    "Institute of Education": "Faculty of Arts and Social Sciences",
+}
+
+
+def _generate_background_text(
+    department: str | None,
+    keywords: list[str],
+    synthesizer: QuerySynthesizer,
+    seed: int,
+    cache: dict[str, str],
+) -> str:
+    """Generate a plausible student background sentence.
+
+    Cached by top keyword + seed so it is row/topic-specific.
+    Falls back to a deterministic template if the LLM is unavailable.
+    """
+    cache_key = f"{keywords[0] if keywords else 'unknown'}:{seed}"
+    if cache_key in cache:
+        return cache[cache_key]
+
+    # Try LLM synthesis via a short topic summary
+    topic_summary = ", ".join(keywords[:4])
+    try:
+        from keyword_extractor.synthesis.llm import LLMSynthesizer
+
+        if isinstance(synthesizer, LLMSynthesizer):
+            text = synthesizer._chat(f"Thesis topic: {topic_summary}\n{_BACKGROUND_PROMPT}")
+            if text:
+                cache[cache_key] = text
+                return text
+    except Exception:
+        pass
+
+    # Deterministic fallback
+    dept_short = (
+        (department or "my department").split("of ")[-1].strip() if department else "my field"
+    )
+    fallback = (
+        f"I have completed coursework in {dept_short} and worked on "
+        f"a semester project related to {keywords[0] if keywords else 'this topic'}."
+    )
+    cache[cache_key] = fallback
+    return fallback
+
+
+def _ablation_background_rows(
+    conn,
+    extractor: KeywordExtractor,
+    synthesizer: QuerySynthesizer,
+    settings: Settings,
+    args: argparse.Namespace,
+) -> list[BenchmarkRow]:
+    """Build 4-arm ablation rows: topic_only / plus_program / plus_background / full.
+
+    Reuses the normal supervisor sampling and keyword extraction, then for each
+    source row produces 4 variants differing only in which student-context
+    fields are included in the query.
+    """
+    # First, generate the normal supervisor rows to get keywords and metadata
+    all_docs: list[str] = []
+    slices: list[tuple[SupervisorCandidate, list[tuple[PublicationRow, str]], int]] = []
+
+    if args.supervisor_names:
+        chosen = [
+            SupervisorCandidate(name=name, cris_uuid=None, publication_count=0)
+            for name in args.supervisor_names
+        ]
+    else:
+        pool = list_supervisor_candidates(
+            conn,
+            min_publications=args.supervisor_min_pubs,
+            language=args.publication_language,
+            require_cris_uuid=args.require_cris_uuid,
+        )
+        chosen = sample_supervisors(pool.candidates, args.supervisor_sample, seed=args.seed)
         print(
-            f"NOTE: {benchmark} has no run manifest, so the corpus its gold "
-            "labels came from is unrecorded. Regenerate it to get one.",
+            f"supervisor candidates: {pool.total}, cris-typed: {pool.cris_typed}, "
+            f"sampled: {len(chosen)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    for cand in chosen:
+        pubs = fetch_publications(
+            conn,
+            [cand.name] + getattr(cand, "aliases", []),
+            language=args.publication_language,
+            max_pubs=args.supervisor_max_pubs or None,
+        )
+        pairs = [(p, doc) for p in pubs if (doc := _compose_doc(p.title, p.abstract))]
+        if not pairs:
+            print(f"skipping {cand.name!r}: no usable publications", file=sys.stderr)
+            continue
+        slices.append((cand, pairs, len(all_docs)))
+        all_docs.extend(doc for _, doc in pairs)
+
+    per_doc = extractor.extract(all_docs)
+    rows: list[BenchmarkRow] = []
+    background_cache: dict[str, str] = {}
+    progress = _Progress("background-ablation", len(slices) * len(_ABLATION_ARMS))
+
+    for cand, pairs, start in slices:
+        keywords = aggregate_keywords(
+            per_doc[start : start + len(pairs)], top_n=settings.keybert_top_n
+        )
+        if not keywords:
+            continue
+
+        pubs = [p for p, _ in pairs]
+        cris_uuid = _resolve_cris_uuid(cand, pubs)
+        department = _most_common([p.department for p in pubs])
+        years = [p.year for p in pubs if p.year]
+        text_language = _most_common([detect_language(doc) for _, doc in pairs])
+
+        # Derive student context once per supervisor
+        faculty = _DEPT_TO_FACULTY.get(department or "", department or "")
+        study_program = f"{faculty}" if faculty else None
+        student_background = _generate_background_text(
+            department, keywords, synthesizer, args.seed, background_cache
+        )
+
+        # 4 arms from the same keyword set, using medium complexity
+        arm_configs = {
+            "topic_only": (None, None),
+            "plus_program": (study_program, None),
+            "plus_background": (None, student_background),
+            "full": (study_program, student_background),
+        }
+
+        for arm, (prog, bg) in arm_configs.items():
+            context = QueryContext(
+                seed=cris_uuid or cand.name,
+                department=department,
+                language=text_language,
+                complexity="medium",
+                study_program=prog,
+                student_background=bg,
+            )
+            result = synthesizer.synthesize(keywords, context)
+            rows.append(
+                BenchmarkRow(
+                    query=result.text,
+                    keywords=select_keywords(keywords, "medium"),
+                    source_type="publication",
+                    source_ids=[p.id for p in pubs],
+                    gold_supervisors=[
+                        GoldSupervisor(
+                            name=cand.name,
+                            cris_uuid=cris_uuid,
+                            authority_type=cand.authority_type or (CRIS if cris_uuid else None),
+                        )
+                    ],
+                    granularity="supervisor",
+                    query_style=f"ablation:{arm}",
+                    complexity="medium",
+                    metadata={
+                        "department": department,
+                        "year_min": min(years) if years else None,
+                        "year_max": max(years) if years else None,
+                        "text_language": text_language,
+                        "db_language": _most_common([p.language for p in pubs]),
+                        "keybert_model": settings.keybert_model,
+                        "all_keywords": keywords,
+                        "seed": args.seed,
+                        "ablation_arm": arm,
+                        "study_program": prog,
+                        "student_background": bg,
+                        "actual_style": result.style,
+                    },
+                )
+            )
+            progress.advance()
+    progress.finish()
+    return rows
+
+
+def _check_fingerprint(
+    manifest: BenchmarkManifest | None,
+    index: dict,
+    benchmark: str,
+    *,
+    strict: bool = True,
+    report_header: dict,
+) -> None:
+    """Compare the benchmark's generation-time fingerprint against the live index.
+
+    Writes ``fingerprint_check``, ``benchmark_fingerprint``, and
+    ``benchmark_corpus_counts`` into *report_header* so every report is
+    self-describing.
+
+    *strict* (default True) controls whether a HARD mismatch aborts the run.
+    Pass ``strict=False`` (``--allow-fingerprint-mismatch``) to downgrade the
+    abort to a warning for intentional cross-index sensitivity runs.
+    """
+    report_header["benchmark_fingerprint"] = None
+    report_header["benchmark_corpus_counts"] = None
+
+    if manifest is None:
+        report_header["fingerprint_check"] = "warn:no_manifest"
+        print(
+            f"WARNING: {benchmark} has no run manifest — fingerprint check "
+            "skipped. Regenerate the benchmark to get one.",
             file=sys.stderr,
             flush=True,
         )
         return
-    was = (manifest.index or {}).get("embedding_model")
-    now = index.get("embedding_model")
-    if was and now and was != now:
+
+    report_header["benchmark_fingerprint"] = manifest.schema_fingerprint
+    report_header["benchmark_corpus_counts"] = manifest.corpus
+
+    # --- HARD: embedding model mismatch ---
+    intended_model = (manifest.index or {}).get("embedding_model")
+    live_model = index.get("embedding_model")
+    if intended_model and live_model and intended_model != live_model:
+        report_header["fingerprint_check"] = "abort:model_mismatch"
+        msg = (
+            f"Index model '{live_model}' != benchmark's intended "
+            f"'{intended_model}'. Rebuild the index or regenerate the "
+            "benchmark."
+        )
+        if strict:
+            raise SystemExit(msg)
+        print(f"WARNING (overridden): {msg}", file=sys.stderr, flush=True)
+
+    # --- HARD: embedding dimension mismatch ---
+    intended_dim = (manifest.index or {}).get("embedding_dim")
+    live_dim = index.get("embedding_dim")
+    if intended_dim and live_dim and intended_dim != live_dim:
+        report_header["fingerprint_check"] = "abort:dim_mismatch"
+        msg = (
+            f"Index dimension {live_dim} != benchmark's intended "
+            f"{intended_dim}. Rebuild the index or regenerate the "
+            "benchmark."
+        )
+        if strict:
+            raise SystemExit(msg)
+        print(f"WARNING (overridden): {msg}", file=sys.stderr, flush=True)
+
+    # --- SOFT: corpus / document-count drift ---
+    manifest_docs = manifest.corpus.get("publications", 0) + manifest.corpus.get("postings", 0)
+    index_docs = index.get("document_count")
+    if manifest_docs and index_docs and abs(index_docs - manifest_docs) / manifest_docs > 0.01:
+        report_header.setdefault("fingerprint_check", "warn:doc_count_drift")
         print(
-            f"WARNING: this benchmark was generated against an index built with {was}, "
-            f"but the matcher answering is on {now}. The scores are not comparable "
-            "with earlier runs of the same file.",
+            f"WARNING: corpus drift — benchmark was generated against "
+            f"{manifest_docs} documents, but the index has {index_docs}. "
+            "Ground truth may have moved since the benchmark was built.",
             file=sys.stderr,
             flush=True,
         )
+
+    report_header.setdefault("fingerprint_check", "ok")
 
 
 def _index_status_if_reachable(settings: Settings) -> dict | None:
@@ -454,10 +851,15 @@ def _generate(args: argparse.Namespace) -> int:
 
     rows: list[BenchmarkRow] = []
     with connect(settings) as conn:
-        if "publications" in sources:
-            rows.extend(_supervisor_rows(conn, extractor, synthesizer, settings, args))
-        if "postings" in sources:
-            rows.extend(_posting_rows(conn, extractor, synthesizer, settings, args))
+        if getattr(args, "specificity", False):
+            rows.extend(_specificity_rows(conn, extractor, synthesizer, settings, args))
+        elif getattr(args, "ablation_background", False):
+            rows.extend(_ablation_background_rows(conn, extractor, synthesizer, settings, args))
+        else:
+            if "publications" in sources:
+                rows.extend(_supervisor_rows(conn, extractor, synthesizer, settings, args))
+            if "postings" in sources:
+                rows.extend(_posting_rows(conn, extractor, synthesizer, settings, args))
         # Read inside the same connection as the rows themselves, so the
         # manifest describes the corpus these labels actually came from.
         corpus = corpus_stats(conn, min_publications=args.supervisor_min_pubs)
@@ -565,16 +967,26 @@ def _evaluate(args: argparse.Namespace) -> int:
             flush=True,
         )
         manifest = read_manifest(Path(args.benchmark))
-        _warn_on_index_drift(manifest, index, args.benchmark)
-        report = evaluate(
-            rows, top_k=args.top_k, find=client.match, concurrency=concurrency
+        report_header: dict = {}
+        _check_fingerprint(
+            manifest,
+            index,
+            args.benchmark,
+            strict=not args.allow_fingerprint_mismatch,
+            report_header=report_header,
         )
+        report = evaluate(rows, top_k=args.top_k, find=client.match, concurrency=concurrency)
     finally:
         client.close()
 
     print(
         json.dumps(
-            {"index": index, "label": args.label, "summary": report.summary},
+            {
+                "index": index,
+                "label": args.label,
+                **report_header,
+                "summary": report.summary,
+            },
             indent=2,
         )
     )
@@ -631,9 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         "already restricts uzh_authors to registered UZH researchers -- so the "
         "printed candidate/cris-typed pair is really an invariant check",
     )
-    gen.add_argument(
-        "--posting-sample", type=int, default=25, help="postings to sample; 0 = all"
-    )
+    gen.add_argument("--posting-sample", type=int, default=25, help="postings to sample; 0 = all")
     gen.add_argument(
         "--publication-language",
         default=None,
@@ -648,6 +1058,46 @@ def main(argv: list[str] | None = None) -> int:
         help="keyphrases per source; overrides KEYBERT_TOP_N",
     )
     gen.add_argument("--query-style", choices=("auto", "template", "llm"), default="auto")
+    gen.add_argument(
+        "--difficulty-threshold",
+        type=int,
+        default=10,
+        help="publication count at or above which a supervisor is tagged 'easy'; "
+        "below is 'hard'. Postings are always 'easy'. Default 10 (between "
+        "--supervisor-min-pubs 3 and --supervisor-max-pubs 20)",
+    )
+    gen.add_argument(
+        "--specificity",
+        action="store_true",
+        default=False,
+        help="specificity ablation mode: generates 3 rows per supervisor "
+        "(general/adjacent/true) instead of the normal 3-complexity output. "
+        "Requires --supervisor-names and --adjacent",
+    )
+    gen.add_argument(
+        "--adjacent",
+        action="append",
+        default=None,
+        help="'SupervisorName=adjacent subfield' for the specificity ablation. "
+        "Repeatable, one per supervisor. Example: "
+        '"Sennrich, R=text summarisation"',
+    )
+    gen.add_argument(
+        "--general",
+        action="append",
+        default=None,
+        help="'SupervisorName=general field' for the specificity ablation. "
+        "Repeatable, one per supervisor. Example: "
+        '"Sennrich, R=natural language processing"',
+    )
+    gen.add_argument(
+        "--ablation-background",
+        action="store_true",
+        default=False,
+        help="background ablation mode: generates 4 arms per supervisor "
+        "(topic_only / plus_program / plus_background / full) to test whether "
+        "student context helps or hurts retrieval",
+    )
     _add_log_level(gen)
     _add_renamed_flags(gen)
 
@@ -676,6 +1126,14 @@ def main(argv: list[str] | None = None) -> int:
         help="free-text note recorded in the report, e.g. the matcher's retrieval "
         "regime. GET /v1/index/status reports the index but not whether the server "
         "was configured to require a UZH author, so that has to be recorded here",
+    )
+    ev.add_argument(
+        "--allow-fingerprint-mismatch",
+        action="store_true",
+        default=False,
+        help="downgrade a hard fingerprint mismatch (model/dimension) from an abort "
+        "to a warning. Use for intentional cross-index sensitivity runs (e.g. "
+        "scoring the same benchmark against a differently configured matcher)",
     )
     _add_log_level(ev)
 

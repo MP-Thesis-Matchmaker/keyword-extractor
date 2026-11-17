@@ -1,0 +1,48 @@
+{
+  "generated_at": "2026-08-31T15:49:06.827236+00:00",
+  "schema_fingerprint": "032028c3e280",
+  "corpus": {
+    "publications": 214756,
+    "publications_with_uzh_authors": 53545,
+    "distinct_uzh_author_names": 2942,
+    "postings": 695
+  },
+  "index": {
+    "embedding_model": "BAAI/bge-m3",
+    "embedding_dim": 1024,
+    "document_count": 215451,
+    "sources": "postgres",
+    "max_seq_length": 1024,
+    "truncated_docs": 8
+  },
+  "run": {
+    "argv": [
+      "generate",
+      "--supervisor-sample",
+      "150",
+      "--posting-sample",
+      "150",
+      "--difficulty-threshold",
+      "10",
+      "--seed",
+      "42",
+      "--out",
+      "data/benchmark_v4.jsonl"
+    ],
+    "rows": 900,
+    "seed": 42,
+    "keybert_model": "paraphrase-multilingual-MiniLM-L12-v2",
+    "keybert_top_n": 8,
+    "supervisor_sample": 150,
+    "supervisor_min_pubs": 3,
+    "supervisor_max_pubs": 20,
+    "posting_sample": 150,
+    "publication_language": null,
+    "require_cris_uuid": true,
+    "query_style": "auto",
+    "sources": [
+      "postings",
+      "publications"
+    ]
+  }
+}
